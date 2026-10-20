@@ -316,18 +316,13 @@ pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
     return @intCast(t);
 }
 
-/// Whether the sampler cannot draw this request: above temperature 0 it needs a top_k from 1 to sampling.max_top_k.
-fn unsupported(s: ?lanes.Sampling) bool {
-    const sm = s orelse return false;
-    return sm.temperature > 0 and (sm.top_k == 0 or sm.top_k > sampling.max_top_k);
-}
-
-/// The candidates each row of a round takes from the device (TF_DS_GPU_CANDIDATES), else 0: all sampled, drawable.
+/// The candidates each row of a round takes from the device (TF_DS_GPU_CANDIDATES), else 0: all sampled, each with a
+/// top_k from 1 to sampling.device_top_k (top_k off or wider: the round reads its logits).
 fn candidateWidth(windows: []const be.Window) usize {
     var width: usize = 0;
     for (windows) |w| {
         const sm = w.stream.sampling orelse return 0; // (a greedy window keeps the argmax or the logits' path)
-        if (sm.temperature <= 0 or unsupported(sm)) return 0;
+        if (sm.temperature <= 0 or sm.top_k == 0 or sm.top_k > sampling.device_top_k) return 0;
         width = @max(width, sm.top_k + sampling.margin);
     }
     return width;
@@ -763,7 +758,6 @@ pub const Lanes = struct {
         const ids = s.prompt();
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
-        if (unsupported(s.sampling)) return error.SamplingNotSupported;
         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
         if (size > m.pool_cap) return error.PromptTooLong;
         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
@@ -1845,25 +1839,14 @@ test "a save that failed after its state was made leaves nothing in the list" {
     try std.testing.expectEqual(@as(u64, 2), ln.next_snap); // (an id is never used twice: rank 1 keeps states by it)
 }
 
-test "a sampling the sampler cannot draw is refused before a frame is built" {
-    const gpa = std.testing.allocator;
-    var m: Model = undefined;
-    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = .{ .fd = -1 } };
-    defer ln.wire.deinit(gpa);
-    const prompt = [_]u32{ 1, 2, 3 };
-    for ([_]u32{ 0, sampling.max_top_k + 1, std.math.maxInt(u32) }) |k| {
-        var s = try lanes.Stream.init(gpa, .{ .id = "t", .prompt = &prompt, .max_new = 8, .sampling = .{ .seed = 1, .temperature = 0.7, .top_k = k } });
-        defer s.deinit(gpa);
-        try std.testing.expectError(error.SamplingNotSupported, ln.fillOpen(&s));
-        try std.testing.expectEqual(@as(u64, 0), ln.step); // no begin, so no frame
-        try std.testing.expectEqual(@as(usize, 0), ln.wire.buf.items.len);
+test "a row draws with top_k off and with a top_k past the device's list, as the sampler does from its logits" {
+    var row: [3000]f32 = undefined;
+    for (&row, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 7919) % 1009)) / 97 - 5;
+    for ([_]u32{ 0, sampling.device_top_k + 1, 1000, std.math.maxInt(u32) }) |k| {
+        const s: lanes.Sampling = .{ .seed = 9, .temperature = 0.7, .top_k = k, .top_p = 0.95 };
+        const want = try sampling.sampleRow(&row, 77, .{ .seed = 9, .temperature = 0.7, .top_k = k, .top_p = 0.95 });
+        try std.testing.expectEqual(@as(u32, @intCast(want)), try draw(&row, 77, s));
     }
-    try std.testing.expect(!unsupported(null));
-    try std.testing.expect(!unsupported(.{ .seed = 1, .temperature = 0, .top_k = 0 })); // greedy reads no top_k
-    try std.testing.expect(!unsupported(.{ .seed = 1, .temperature = 0.7, .top_k = 1 }));
-    try std.testing.expect(!unsupported(.{ .seed = 1, .temperature = 0.7, .top_k = sampling.max_top_k }));
-    try std.testing.expect(unsupported(.{ .seed = 1, .temperature = 0.7, .top_k = 0 }));
-    try std.testing.expect(unsupported(.{ .seed = 1, .temperature = 0.7, .top_k = sampling.max_top_k + 1 }));
 }
 
 test "round shape sums by the streams of a round and of a pass, and prints as one JSON line" {
@@ -1942,7 +1925,7 @@ test "the shape line is said every shape_every rounds and the sums start over" {
     try std.testing.expectEqual(@as(u64, 2), ln.shape_every);
 }
 
-test "device candidates serve a round only when every window is sampled with a top_k the sampler draws" {
+test "device candidates serve a round only when every window is sampled with a top_k the device list serves" {
     const gpa = std.testing.allocator;
     const prompt = [_]u32{ 1, 2, 3 };
     const settings = [_]?lanes.Sampling{
@@ -1951,8 +1934,8 @@ test "device candidates serve a round only when every window is sampled with a t
         .{ .seed = 3, .temperature = 0.7, .top_k = 1 }, // 9
         null, // greedy
         .{ .seed = 4, .temperature = 0, .top_k = 20 }, // greedy by its temperature
-        .{ .seed = 5, .temperature = 0.7, .top_k = 0 }, // the nucleus path the sampler lacks
-        .{ .seed = 6, .temperature = 0.7, .top_k = 57 }, // past max_top_k
+        .{ .seed = 5, .temperature = 0.7, .top_k = 0 }, // top_k off: the logits' nucleus path
+        .{ .seed = 6, .temperature = 0.7, .top_k = 57 }, // past device_top_k: the logits
     };
     var streams: [settings.len]lanes.Stream = undefined;
     var windows: [settings.len]be.Window = undefined;

@@ -35,7 +35,6 @@ const rank_cache = @import("rank_cache.zig");
 const vision_mod = @import("vision.zig");
 const spill_lanes = @import("spill_lanes.zig");
 const spill_async = @import("spill_async.zig");
-const sampling = @import("sampling.zig");
 
 pub const model_type = "deepseek_v41";
 pub const formats: []const []const u8 = &.{"exl3-mul1"};
@@ -205,9 +204,6 @@ fn deinitFn(ptr: *anyopaque) void {
     st.gpa.destroy(st);
 }
 
-/// What a sampled request needs: the sampler draws from top_k + its margin candidates, so top_k has a ceiling.
-const sampling_words = std.fmt.comptimePrint("top_k must be 1-{d} when sampling", .{sampling.max_top_k});
-
 /// A request or a start this engine refuses, in words; null: none of its own.
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
@@ -222,7 +218,6 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.BadSpillGib, error.BadSpillMin, error.BadSpillStaging => "TF_DS_SPILL_GIB, TF_DS_SPILL_MIN_TOKENS and TF_DS_SPILL_STAGING_MIB take numbers",
-        error.SamplingNotSupported => sampling_words,
         error.BadWatchdog => "TF_DS_WATCHDOG_S takes whole seconds (default 120; 0 turns the watchdog off)",
         error.BadWatchdogStart => "TF_DS_WATCHDOG_START_S takes whole seconds (default 600; 0 leaves the start-up exchange unwatched)",
         error.BadShapeLog => "TF_DS_SHAPE_LOG takes a number of rounds between log lines (0 is off, 1 is 256)",
@@ -234,7 +229,6 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
-    try std.testing.expectEqualStrings("top_k must be 1-56 when sampling", explain(null, error.SamplingNotSupported).?);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadWatchdog).?, "TF_DS_WATCHDOG_S") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadWatchdogStart).?, "TF_DS_WATCHDOG_START_S") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadShapeLog).?, "TF_DS_SHAPE_LOG") != null);
