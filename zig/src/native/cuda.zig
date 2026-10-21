@@ -193,6 +193,7 @@ const Host = struct {
             if (v == 0) h.cfg.max_copy = 0;
         }
         if (envInt("TF_LANES_SOLO_US")) |v| h.cfg.solo_overhead_ms = @as(f64, @floatFromInt(v)) / 1000.0;
+        if (envInt("TF_LANES_SLACK")) |v| h.cfg.k.draft_slack = v; // drafts past the last grant (default 2)
         h.clock = .{ .io = io };
         h.core = lanes.Engine.init(h.gpa, &h.cfg, h.backend(), h.clock.clock());
         errdefer h.core.deinit();
