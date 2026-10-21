@@ -63,6 +63,7 @@ pub const Config = struct {
     mtp_step_ms: f64,
     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
+    solo_overhead_ms: ?f64 = null, // a lone stream's round ms past its forward in allocation (null: measured)
     k: Constants = .{},
 
     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {

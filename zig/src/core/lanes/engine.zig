@@ -62,6 +62,7 @@ pub const Engine = struct {
                 .plain_guard = cfg.plain_guard,
                 .node_probabilities = cfg.node_probabilities,
                 .batch_rows = cfg.batch_rows,
+                .solo_overhead_ms = cfg.solo_overhead_ms,
             },
         };
     }

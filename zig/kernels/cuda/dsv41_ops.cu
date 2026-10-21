@@ -406,6 +406,78 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_argmax_rows_kernel(cons
     if (lane == 0) out[blockIdx.x] = row[0] != row[0] ? 0u : (unsigned)bi;
 }
 
+// After a Markov step (a block, a thread a cached row): a hit renews its row, a new token takes the least recent one.
+extern "C" __global__ void __launch_bounds__(1024) tf_ds_markov_plan_kernel(const long long* tok, long long ts, int n,
+                                                                             int* slot, int* owner,
+                                                                             unsigned long long* stamp,
+                                                                             unsigned long long* clock, int* plan,
+                                                                             int keep) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+    __shared__ long long st[16];
+    __shared__ int ss[16];
+    __shared__ unsigned long long best[32];
+    const int j = threadIdx.x;
+    const int warps = (int)(blockDim.x >> 5);
+    const unsigned long long now = *clock;
+    if (j < n) {
+        st[j] = tok[j * ts];
+        ss[j] = slot[st[j]];
+    }
+    __syncthreads();
+    unsigned long long mine = stamp[j];
+    for (int s = 0; s < n; ++s)
+        if (ss[s] == j) mine = now;
+    int count = 0;
+    for (int s = 0; s < n; ++s) {
+        bool skip = ss[s] >= 0;
+        for (int r = 0; r < s; ++r) skip |= ss[r] < 0 && st[r] == st[s];
+        if (skip) continue;
+        unsigned long long key = j >= keep ? (mine << 16) | (unsigned long long)j : ~0ull; // the lower row on a tie
+        for (int off = 16; off > 0; off >>= 1) {
+            const unsigned long long o = __shfl_down_sync(0xffffffffu, key, off);
+            if (o < key) key = o;
+        }
+        if ((j & 31) == 0) best[j >> 5] = key;
+        __syncthreads();
+        key = best[0];
+        for (int w = 1; w < warps; ++w)
+            if (best[w] < key) key = best[w];
+        __syncthreads();
+        const int v = (int)(key & 0xffff);
+        if (j == v) mine = now;
+        if (j == 0) {
+            const int old = owner[v];
+            if (old >= 0 && slot[old] == v) slot[old] = -1;
+            slot[st[s]] = v;
+            owner[v] = (int)st[s];
+            plan[1 + 2 * count] = s;
+            plan[2 + 2 * count] = v;
+        }
+        ++count;
+    }
+    stamp[j] = mine;
+    if (j == 0) {
+        plan[0] = count;
+        *clock = now + 1;
+    }
+}
+
+// A step's plan (count, then stage row and cache row pairs): those stage rows into their cache rows, 16-byte words.
+extern "C" __global__ void tf_ds_markov_rows_kernel(const int* plan, const uint4* stage, unsigned long long s_ld,
+                                                    uint4* cache, unsigned long long c_ld, unsigned long long n16) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+    const int e = blockIdx.y;
+    if (e >= plan[0]) return;
+    const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n16) cache[plan[2 + 2 * e] * c_ld + i] = stage[plan[1 + 2 * e] * s_ld + i];
+}
+
+#include "dsv41_hc.cuh"
+
 // ---- the vision tower (vit.zig): DeepSeek's ViT and aligner as the served lane runs them on torch, each torch op its
 // own rounding point (this file builds with --fmad=false, so a product and a sum stay two roundings).
 

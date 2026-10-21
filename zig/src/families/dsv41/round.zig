@@ -376,9 +376,9 @@ pub const Round = struct {
     }
 
     /// These ranges touched into L2 behind the work queued so far, on the prefetch stream.
-    /// One paced L2 prefetch launch on its stream: `ranges` in order, the last one cut where the launch reaches `budget`
-    /// bytes (the served launches move at most 16 MiB, 8 MiB behind wo_b).
-    fn prefetch(rd: *Round, e: *const Engine, ranges: []const [2]u64, budget: u64) !void {
+    /// One paced L2 prefetch launch on its stream at fork `f`'s pace: `ranges` in order, the last one cut where the
+    /// launch reaches `budget` bytes (the served launches move at most 16 MiB, 8 MiB behind wo_b).
+    fn prefetch(rd: *Round, e: *const Engine, ranges: []const [2]u64, f: Fork, budget: u64) !void {
         const s = rd.pf orelse return;
         var a: ops_mod.Prefetch = .{};
         var left = budget;
@@ -393,7 +393,7 @@ pub const Round = struct {
         if (a.n == 0) return;
         try rd.pf_fork.?.record(e.s);
         try s.wait(rd.pf_fork.?);
-        try e.ops.l2Prefetch(s, a);
+        try e.ops.l2Prefetch(s, a, fork_gbps[@intFromEnum(f)]);
         try rd.pf_join.?.record(s);
         rd.pf_out = true;
     }
@@ -577,7 +577,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         var r: [5][2]u64 = @splat(.{ 0, 0 });
         for (lay.wo_a[0..lay.groups], 0..) |wo, j| r[j] = linearBytes(wo);
         r[4] = linearBytes(lay.wo_b);
-        try rd.prefetch(e, &r, prefetch_budget);
+        try rd.prefetch(e, &r, .attn, forkBudget(.attn));
     }
     try rd.mark(e, .a_q);
     // _kv_idx: the compressor's caches (a kv source) and the indexer's selection
@@ -725,7 +725,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
     try prompt.groupedRotated(e, ch, R, &cb_call);
     // the prefetch behind wo_b: the ffn mix's weights, the router, the shared expert's gate
-    try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, prefetch_budget / 2);
+    try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, .ffn, forkBudget(.ffn));
 }
 
 /// Model.moe of a decode window (shared_side off: SHARED_OVERLAP unset in the served lane): the gate's chunk sums
@@ -751,11 +751,11 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     if (li + 1 < e.w.layers.len) {
         const nx = e.w.layers[li + 1];
         if (nx.engram_wkv) |ew| {
-            try rd.prefetch(e, &.{linearBytes(ew)}, prefetch_budget / 4);
+            try rd.prefetch(e, &.{linearBytes(ew)}, .next, forkBudget(.next) / 4);
         } else {
-            try rd.prefetch(e, &.{ .{ nx.hc_attn[0], hcFnBytes(c) }, linearBytes(nx.wq_a), linearBytes(nx.wkv), if (nx.comp_wkv) |x| linearBytes(x) else .{ 0, 0 }, if (nx.comp_wgate) |x| linearBytes(x) else .{ 0, 0 }, linearBytes(nx.wq_b) }, prefetch_budget);
+            try rd.prefetch(e, &.{ .{ nx.hc_attn[0], hcFnBytes(c) }, linearBytes(nx.wq_a), linearBytes(nx.wkv), if (nx.comp_wkv) |x| linearBytes(x) else .{ 0, 0 }, if (nx.comp_wgate) |x| linearBytes(x) else .{ 0, 0 }, linearBytes(nx.wq_b) }, .next, forkBudget(.next));
         }
-    } else try rd.prefetch(e, &.{linearBytes(e.w.head)}, prefetch_budget);
+    } else try rd.prefetch(e, &.{linearBytes(e.w.head)}, .next, forkBudget(.next));
 }
 
 /// An EXL3 linear's words: their first byte and length (k * n values of k2 / 2 bits).
@@ -763,9 +763,33 @@ fn linearBytes(l: weights.Linear) [2]u64 {
     return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
 }
 
-/// A paced prefetch launch's most bytes (the served launch trace: 16 MiB; 8 MiB behind wo_b, 4 MiB before an Engram
-/// layer).
-const prefetch_budget: u64 = 16 << 20;
+/// The paced prefetch forks: behind q's linears, behind wo_b, behind the experts (and the Engram and head launches).
+pub const Fork = enum { attn, ffn, next };
+/// Each fork's most bytes and GB/s as served (an Engram layer's fork takes a quarter); prefetchEnv may replace them.
+const served_budget = [3]u64{ 16 << 20, 8 << 20, 16 << 20 };
+const served_gbps: f64 = 230.0;
+pub var fork_budget = served_budget;
+pub var fork_gbps: [3]f64 = @splat(served_gbps);
+
+fn forkBudget(f: Fork) u64 {
+    return fork_budget[@intFromEnum(f)];
+}
+
+/// TF_DS_L2_MIB_<FORK> and TF_DS_L2_GBPS_<FORK> (ATTN, FFN, NEXT): A/B settings read once at model open, every rank.
+pub fn prefetchEnv() void {
+    inline for (.{ .{ Fork.attn, "ATTN" }, .{ Fork.ffn, "FFN" }, .{ Fork.next, "NEXT" } }) |f| {
+        const i = @intFromEnum(f[0]);
+        if (std.c.getenv("TF_DS_L2_MIB_" ++ f[1])) |v| {
+            if (std.fmt.parseInt(u64, std.mem.span(v), 10)) |mib| fork_budget[i] = @as(u64, @min(mib, 64)) << 20 else |_| {}
+        }
+        if (std.c.getenv("TF_DS_L2_GBPS_" ++ f[1])) |v| {
+            const g = std.fmt.parseFloat(f64, std.mem.span(v)) catch 0.0;
+            if (g >= 1.0) fork_gbps[i] = g;
+        }
+        if (fork_budget[i] != served_budget[i] or fork_gbps[i] != served_gbps)
+            std.log.info("l2 prefetch fork {s}: {d} MiB at {d} GB/s", .{ f[1], fork_budget[i] >> 20, fork_gbps[i] });
+    }
+}
 
 /// An mHC mix's weights hc_*_fn: fp32 [24, hc * d].
 fn hcFnBytes(c: anytype) u64 {
@@ -1041,7 +1065,9 @@ fn mix(e: *const Engine, rd: *Round, h: u64, spare: *u64, pending: *?u64, params
         rd.side_out = true;
     } else |_| {};
     if (pending.*) |gp| {
-        const out = try tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, .{ .gathered = gp, .world = e.world, .h_out = spare.* }, rd.sink, R, c.hidden);
+        const fm = tri_hc.hcFusedEnv();
+        const ps: tri_hc.Posted = .{ .gathered = gp, .world = e.world, .h_out = spare.*, .fused = if (fm != 0) e.ops else null, .fused_pdl = fm != 2 };
+        const out = try tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, ps, rd.sink, R, c.hidden);
         pending.* = null;
         spare.* = h;
         return out;

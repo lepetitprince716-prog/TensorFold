@@ -37,6 +37,9 @@ pub const Ops = struct {
     copy16: cuda.Function,
     argmax_rows: cuda.Function,
     gpu_clock: cuda.Function,
+    markov_plan: cuda.Function,
+    markov_rows: cuda.Function,
+    hc_post_finish: cuda.Function,
 
     /// The three images (cuda.kernels.torch_pointwise, torch_movement and dsv41_ops, or the fatbins' bytes).
     pub fn load(d: *const cuda.Driver, pointwise: []const u8, movement: []const u8, family: []const u8) !Ops {
@@ -68,6 +71,9 @@ pub const Ops = struct {
             .copy16 = try fm.function("tf_ds_copy_rows16_kernel"),
             .argmax_rows = try fm.function("tf_ds_argmax_rows_kernel"),
             .gpu_clock = try fm.function("tf_ds_clock_kernel"),
+            .markov_plan = try fm.function("tf_ds_markov_plan_kernel"),
+            .markov_rows = try fm.function("tf_ds_markov_rows_kernel"),
+            .hc_post_finish = try fm.function("tf_ds_hc_post_finish_kernel"),
         };
     }
 
@@ -173,13 +179,13 @@ pub const Ops = struct {
         try cuda.launch.launch(o.cand_fast, .{ .grid = .{ .x = blocks(nb, 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
     }
 
-    /// Every 128-byte line of `pf`'s ranges touched into L2 (one block of 128 threads); writes nothing.
-    pub fn l2Prefetch(o: *const Ops, s: cuda.Stream, pf: Prefetch) !void {
+    /// Every 128-byte line of `pf`'s ranges touched into L2 (one block of 128 threads) at `gbps`; writes nothing.
+    pub fn l2Prefetch(o: *const Ops, s: cuda.Stream, pf: Prefetch, gbps: f64) !void {
         if (pf.n == 0) return;
         // the served decode settings (exl3/prefetch.py): 3 us before the first wave, waves of 128 chunks of 8 KiB
         // at 230 GB/s (TF_EXL3_L2_DELAY_NS, TF_EXL3_L2_RATE_GBPS), one block
         const delay_ns: c_longlong = 3000;
-        const wave_ns: c_longlong = @intFromFloat(128.0 * 8192.0 / 230.0);
+        const wave_ns: c_longlong = @intFromFloat(128.0 * 8192.0 / gbps);
         var a: cuda.Args = .{};
         a.add(pf);
         a.add(delay_ns);
@@ -290,6 +296,59 @@ pub const Ops = struct {
         a.add(@as(c_int, @intCast(n)));
         a.add(out);
         try go(o.argmax_rows, s, rows, 1024, &a);
+    }
+
+    /// A Markov step's cache plan for tokens tok [n] int64 (stride ts) over `rows` cached rows, the first `keep` fixed.
+    pub fn markovPlan(o: *const Ops, s: cuda.Stream, tok: u64, ts: usize, n: usize, slot: u64, owner: u64, stamp: u64, clock: u64, plan: u64, rows: usize, keep: usize) !void {
+        if (n == 0) return;
+        if (n > 16 or rows > 1024 or keep >= rows) return error.MarkovPlan;
+        var a: cuda.Args = .{};
+        a.add(tok);
+        a.add(@as(i64, @intCast(ts)));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(slot);
+        a.add(owner);
+        a.add(stamp);
+        a.add(clock);
+        a.add(plan);
+        a.add(@as(c_int, @intCast(keep)));
+        try go(o.markov_plan, s, 1, @intCast(rows), &a);
+    }
+
+    /// The plan's stage rows (n at most) into their cache rows, rows of `bytes` bytes `ld` bytes apart in both.
+    pub fn markovRows(o: *const Ops, s: cuda.Stream, plan: u64, stage: u64, cache: u64, ld: usize, bytes: usize, n: usize) !void {
+        if (n == 0) return;
+        if ((stage | cache | ld | bytes) % 16 != 0) return error.Misaligned;
+        var a: cuda.Args = .{};
+        a.add(plan);
+        a.add(stage);
+        a.add(@as(u64, ld / 16));
+        a.add(cache);
+        a.add(@as(u64, ld / 16));
+        a.add(@as(u64, bytes / 16));
+        try cuda.launch.launch(o.markov_rows, .{ .grid = .{ .x = blocks(bytes / 16, 256), .y = @intCast(n) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// The streams' width tf_ds_hc_post_finish_kernel takes (five of _hc_finish_s's 1024-column blocks).
+    pub const hc_fused_d = 5 * 1024;
+
+    /// _hc_post_only of x into xo, then _hc_finish_s's collapse + RMSNorm of xo into out (SINK 0): one launch.
+    pub fn hcPostFinish(o: *const Ops, s: cuda.Stream, pdl: bool, x: u64, xo: u64, g: u64, world: usize, post: u64, comb: u64, pre_in: u64, nw: u64, out: u64, eps: f32, rows: usize) !void {
+        if (rows == 0) return;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(xo);
+        a.add(g);
+        a.add(@as(i64, @intCast(rows * hc_fused_d)));
+        a.add(@as(c_int, @intCast(world)));
+        a.add(post);
+        a.add(comb);
+        a.add(pre_in);
+        a.add(nw);
+        a.add(out);
+        a.add(eps);
+        // a row a cluster of 8 one-warp blocks (the kernel's __cluster_dims__)
+        try cuda.launch.launch(o.hc_post_finish, .{ .grid = .{ .x = @intCast(8 * rows) }, .block = .{ .x = 32 }, .pdl = pdl }, s, &a);
     }
 
     /// The GPU clock (ns) into buf[i] when the stream reaches it (a profile).

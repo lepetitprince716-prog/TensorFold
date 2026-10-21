@@ -149,6 +149,7 @@ pub const Model = struct {
         m.* = undefined;
         m.gpa = gpa;
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
+        round.prefetchEnv();
         m.spans = .empty;
         m.img_buf = null;
         m.host = std.heap.ArenaAllocator.init(gpa);

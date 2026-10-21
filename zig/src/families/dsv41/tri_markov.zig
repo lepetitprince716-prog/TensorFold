@@ -6,6 +6,8 @@ const tri = @import("tri.zig");
 const config = @import("config.zig");
 const Config = config.Config;
 const Split = @import("plan.zig").Split;
+const prompt = @import("prompt.zig");
+const Ops = @import("ops.zig").Ops;
 const aot = cuda.aot;
 const Tri = tri.Tri;
 const u = tri.u;
@@ -39,6 +41,48 @@ pub const Gather = struct {
     run: *const fn (ctx: *anyopaque, send: u64, rows: usize) anyerror!u64,
 };
 
+/// TF_DS_MARKOV_LRU=1 (an A/B setting): the cached bias rows follow recency instead of staying the load's rows.
+pub fn lruEnv() bool {
+    const v = std.c.getenv("TF_DS_MARKOV_LRU") orelse return false;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// The recency state of the cached rows: after each step a hit renews its row and a new token takes the least recent.
+pub const Lru = struct {
+    ops: *const Ops,
+    owner: u64, // int32 [cache_rows]: each row's token
+    stamp: u64, // u64 [cache_rows]: the step each row was last read or written
+    clock: u64, // u64: the next step's stamp
+    plan: u64, // int32 [1 + 2 np]: a step's new rows (their count, then stage row and cache row pairs)
+
+    /// The rows kept whatever the recency: the load list's most frequent tokens.
+    pub const keep = 64;
+
+    /// The state of the rows fill made from `tokens` (row j holds tokens[j]), the list's later rows the less recent.
+    pub fn init(e: *const prompt.Engine, a: *prompt.Arena, tokens: *const [cache_rows]i64) !Lru {
+        const l: Lru = .{ .ops = e.ops, .owner = try a.take(cache_rows * 4), .stamp = try a.take(cache_rows * 8), .clock = try a.take(8), .plan = try a.take((1 + 2 * np) * 4) };
+        var owner: [cache_rows]i32 = undefined;
+        var stamp: [cache_rows + 1]u64 = undefined;
+        for (tokens, 0..) |t, j| {
+            owner[j] = @intCast(t);
+            stamp[j] = @intCast(cache_rows - j);
+        }
+        stamp[cache_rows] = cache_rows + 1;
+        try prompt.upload(e, l.owner, &owner, cache_rows * 4);
+        try prompt.upload(e, l.stamp, &stamp, cache_rows * 8);
+        try prompt.upload(e, l.clock, &stamp[cache_rows], 8);
+        try e.s.synchronize(); // (the host arrays go with this frame)
+        std.log.info("markov cache: {d} rows by recency, {d} kept", .{ cache_rows, keep });
+        return l;
+    }
+
+    /// After step i: the step's tokens (out[:, i]) renew or take cached rows, new rows copied from the staging rows.
+    fn step(l: Lru, m: Markov, s: cuda.Stream, tok: u64, ts: usize, n: usize, stage: u64) !void {
+        try l.ops.markovPlan(s, tok, ts, n, m.slot, l.owner, l.stamp, l.clock, l.plan, cache_rows, keep);
+        try l.ops.markovRows(s, l.plan, stage, m.cache, m.cols * 2, m.cols * 2, n);
+    }
+};
+
 /// markov.Markov: one drafter's Markov loop on one rank: the head rows it scores, the cached bias rows, every token's slot.
 pub const Markov = struct {
     head: u64, // markov_head [V, rank] fp16
@@ -59,6 +103,7 @@ pub const Markov = struct {
     bp: usize,
     // the head's logits one row of lg_w columns a row (a 2D node's quarter, draft2d.zig); 0: TP2's [segs, rows, n_cols]
     lg_w: usize = 0,
+    lru: ?Lru = null, // TF_DS_MARKOV_LRU: the cached rows' recency state (null: fill's rows stay)
 
     /// Markov.__init__'s geometry for rank s.rank of s.world (head and emb [V, rank]); fill then makes the cached rows.
     pub fn init(c: Config, s: Split, head: u64, emb: u64, none: u64) !Markov {
@@ -134,8 +179,9 @@ pub const Markov = struct {
     /// Markov.steps: out [N, count + 1] int64 (out[:, 0] the last tokens) -> out[:, 1:] the drafts, each step's bests gathered over the ranks before its pick.
     pub fn steps(m: Markov, t: Tri, lg: u64, out: u64, ts: usize, n: usize, block: usize, count: usize, sc: Scratch, gather: Gather) !void {
         for (0..count) |i| {
-            const send = try m.localBest(t, lg, out, ts, n, block, i, sc) orelse continue;
-            try m.pick(t, try gather.run(gather.ctx, send, n), m.world, out, ts, n, i);
+            const send = try m.localBest(t, lg, out, ts, n, block, i, sc);
+            if (m.lru) |l| try l.step(m, t.stream, out + 8 * i, ts, n, sc.stage);
+            try m.pick(t, try gather.run(gather.ctx, send orelse continue, n), m.world, out, ts, n, i);
         }
     }
 };

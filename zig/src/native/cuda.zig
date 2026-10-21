@@ -188,6 +188,11 @@ const Host = struct {
     fn serve(h: *Host, io: std.Io, facts: lanes.Model, rows: u32, info: api.Info, explain: ?api.Explain) !void {
         h.cfg = try lanes.Config.init(h.gpa, facts, rows, rows - 1);
         errdefer h.cfg.deinit(h.gpa);
+        // A/B runs: TF_LANES_COPY=0 drops copied spans, TF_LANES_SOLO_US=N fixes a lone stream's overhead at N us
+        if (envInt("TF_LANES_COPY")) |v| {
+            if (v == 0) h.cfg.max_copy = 0;
+        }
+        if (envInt("TF_LANES_SOLO_US")) |v| h.cfg.solo_overhead_ms = @as(f64, @floatFromInt(v)) / 1000.0;
         h.clock = .{ .io = io };
         h.core = lanes.Engine.init(h.gpa, &h.cfg, h.backend(), h.clock.clock());
         errdefer h.core.deinit();

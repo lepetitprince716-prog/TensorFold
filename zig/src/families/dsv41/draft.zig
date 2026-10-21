@@ -327,6 +327,7 @@ pub const Drafter = struct {
             try e.s.synchronize(); // (the host table is freed next)
         }
         try dr.mk.fill(e.t, tok, k, cache, slot);
+        if (tri_markov.lruEnv()) dr.mk.lru = try tri_markov.Lru.init(e, a, &markov_tokens.cached);
         dr.msc = .{
             .pv = try a.take(max_streams * dr.mk.n_part * 4),
             .pi = try a.take(max_streams * dr.mk.n_part * 4),

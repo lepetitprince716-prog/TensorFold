@@ -58,6 +58,7 @@ pub const Rule = struct {
     batch_rows: u32,
     round_ms: Table = .{}, // a round's wall time by drafts, shared by every stream
     overhead: std.ArrayList(Overhead) = .empty, // a shared round's ms past its forward, by streams (insertion order)
+    solo_overhead_ms: ?f64 = null, // a fixed price in place of the measured one for a lone stream
 
     pub fn deinit(r: *Rule) void {
         r.round_ms.deinit(r.gpa);
@@ -230,6 +231,7 @@ pub const Rule = struct {
 
     /// A shared round's ms beyond its forward at this many streams (the nearest measured count, first seen on ties).
     pub fn overheadMs(r: *const Rule, streams: usize) f64 {
+        if (streams == 1) if (r.solo_overhead_ms) |ms| return ms;
         if (r.overhead.items.len == 0) return 8.0;
         var best = r.overhead.items[0];
         for (r.overhead.items[1..]) |o| {

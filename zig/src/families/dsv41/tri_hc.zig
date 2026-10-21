@@ -8,6 +8,7 @@ const Tri = tri.Tri;
 const u = tri.u;
 const p = aot.ptr;
 const hc_blocks = @import("tri_basic.zig").hc_blocks;
+const Ops = @import("ops.zig").Ops;
 
 /// kernels.HC_PF_RB: hc_mix_pf's rows a program (TF_DS_HC_PF_RB is unset in the served build).
 pub const hc_pf_rb = 8;
@@ -48,7 +49,19 @@ pub fn hcPf2Ok(d: usize) bool {
 }
 
 /// The previous sublayer's post to fuse in (Python's gathered, h_out): partials [world, R, D] fp32, into h_out (not h).
-pub const Posted = struct { gathered: u64, world: usize, h_out: u64 };
+pub const Posted = struct {
+    gathered: u64,
+    world: usize,
+    h_out: u64,
+    fused: ?*const Ops = null, // TF_DS_HC_FUSED: hc_dots' post and finish as Ops.hcPostFinish (null: the two kernels)
+    fused_pdl: bool = true, // TF_DS_HC_FUSED=2: that launch without PDL
+};
+
+/// TF_DS_HC_FUSED (an A/B setting): 1 hc_dots' _hc_post_only and _hc_finish_s as one CUDA launch, 2 that without PDL.
+pub fn hcFusedEnv() u8 {
+    const v = std.mem.span(std.c.getenv("TF_DS_HC_FUSED") orelse return 0);
+    return if (std.mem.eql(u8, v, "0")) 0 else if (std.mem.eql(u8, v, "2")) 2 else 1;
+}
 
 /// hc_pre2's `sink` (only if hcDeferOn(d)): a side stream and the event forking it; the caller joins it (rounds.py).
 pub const Sink = struct { s: cuda.Stream, fork: cuda.Event };
@@ -122,11 +135,15 @@ pub fn hcPre2(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, nor
     if (sink != null and posted != null and hcDotsOn(d)) {
         // hc_dots: the post alone and the finish here, the mixes of the stored streams and the Sinkhorn on the side one
         const ps = posted.?;
-        try t.run("_hc_post_only", .{ u(rows), hc_blocks, 1 }, &.{
-            p("X", "*bf16", h),       p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered), aot.int("RS", @intCast(rows * d)),
-            p("POST", "*fp32", post), p("COMB", "*fp32", comb),
-        }, &.{ ci("WIDE", 4 * d), ci("D", d), ci("KB", 4 * d / hc_blocks), ci("WORLD", ps.world), t.pdlConst() });
-        try finishSplit(t, ps.h_out, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps, iters, true, rows, d);
+        if (ps.fused != null and t.log == null and d == Ops.hc_fused_d) {
+            try ps.fused.?.hcPostFinish(t.stream, t.pdl and ps.fused_pdl, h, ps.h_out, ps.gathered, ps.world, post, comb, pre_in, norm_w, out, eps, rows);
+        } else {
+            try t.run("_hc_post_only", .{ u(rows), hc_blocks, 1 }, &.{
+                p("X", "*bf16", h),       p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered), aot.int("RS", @intCast(rows * d)),
+                p("POST", "*fp32", post), p("COMB", "*fp32", comb),
+            }, &.{ ci("WIDE", 4 * d), ci("D", d), ci("KB", 4 * d / hc_blocks), ci("WORLD", ps.world), t.pdlConst() });
+            try finishSplit(t, ps.h_out, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps, iters, true, rows, d);
+        }
         const st = try sinkTri(t, sink.?);
         try mixPart(st, ps.h_out, null, post, comb, fn_w, part, rows, d);
         try sinkhorn(st, part, base, scale, pre_out, post, comb, eps, hc_eps, iters, rows, d);
