@@ -406,6 +406,8 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_argmax_rows_kernel(cons
     if (lane == 0) out[blockIdx.x] = row[0] != row[0] ? 0u : (unsigned)bi;
 }
 
+#include "dsv41_candidates.cuh"
+
 // After a Markov step (a block, a thread a cached row): a hit renews its row, a new token takes the least recent one.
 extern "C" __global__ void __launch_bounds__(1024) tf_ds_markov_plan_kernel(const long long* tok, long long ts, int n,
                                                                              int* slot, int* owner,

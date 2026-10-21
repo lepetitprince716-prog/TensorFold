@@ -36,6 +36,7 @@ pub const Ops = struct {
     gather: cuda.Function,
     copy16: cuda.Function,
     argmax_rows: cuda.Function,
+    candidates: cuda.Function,
     gpu_clock: cuda.Function,
     markov_plan: cuda.Function,
     markov_rows: cuda.Function,
@@ -70,6 +71,7 @@ pub const Ops = struct {
             .gather = try mv.function("tf_gather_rows_kernel"),
             .copy16 = try fm.function("tf_ds_copy_rows16_kernel"),
             .argmax_rows = try fm.function("tf_ds_argmax_rows_kernel"),
+            .candidates = try fm.function("tf_ds_candidates_kernel"),
             .gpu_clock = try fm.function("tf_ds_clock_kernel"),
             .markov_plan = try fm.function("tf_ds_markov_plan_kernel"),
             .markov_rows = try fm.function("tf_ds_markov_rows_kernel"),
@@ -306,6 +308,30 @@ pub const Ops = struct {
         a.add(@as(c_int, @intCast(n)));
         a.add(out);
         try go(o.argmax_rows, s, rows, 1024, &a);
+    }
+
+    /// The columns a candidates block reads (dsv41_candidates.cuh); candidateRows' scratch holds a list per tile.
+    pub const candidate_tile = 4096;
+
+    /// The `k` largest logits of each row, as sampling.topCandidates lists them: out [rows, k] of sampling.Candidate.
+    pub fn candidateRows(o: *const Ops, s: cuda.Stream, logits: u64, ld: usize, n: usize, rows: usize, k: usize, scratch: u64, out: u64) !void {
+        // logits [rows, n] fp32 (row stride ld floats); scratch holds rows * ceil(n / candidate_tile) * k candidates
+        if (rows == 0) return;
+        if (k == 0 or k > 64 or k > n) return error.BadCandidates;
+        const tiles = (n + candidate_tile - 1) / candidate_tile;
+        // two launches: each tile's top k, then each row's merge; a NaN in a row marks its k entries sampling.nan_row
+        for (0..2) |stage| {
+            var a: cuda.Args = .{};
+            a.add(logits);
+            a.add(scratch);
+            a.add(if (stage == 0) scratch else out);
+            a.add(@as(u64, ld));
+            a.add(@as(c_int, @intCast(n)));
+            a.add(@as(c_int, @intCast(k)));
+            a.add(@as(c_int, @intCast(tiles)));
+            a.add(@as(c_int, @intCast(stage)));
+            try cuda.launch.launch(o.candidates, .{ .grid = .{ .x = @intCast(if (stage == 0) tiles else 1), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+        }
     }
 
     /// A Markov step's cache plan for tokens tok [n] int64 (stride ts) over `rows` cached rows, the first `keep` fixed.

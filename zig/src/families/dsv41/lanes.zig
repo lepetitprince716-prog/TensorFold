@@ -319,6 +319,32 @@ fn unsupported(s: ?lanes.Sampling) bool {
     return sm.temperature > 0 and (sm.top_k == 0 or sm.top_k > sampling.max_top_k);
 }
 
+/// The candidates each row of a round takes from the device (TF_DS_GPU_CANDIDATES), else 0: all sampled, drawable.
+fn candidateWidth(windows: []const be.Window) usize {
+    var width: usize = 0;
+    for (windows) |w| {
+        const sm = w.stream.sampling orelse return 0; // (a greedy window keeps the argmax or the logits' path)
+        if (sm.temperature <= 0 or unsupported(sm)) return 0;
+        width = @max(width, sm.top_k + sampling.margin);
+    }
+    return width;
+}
+
+/// The token a sampled row draws at `position` from its device candidates, as draw does from its logits.
+fn drawCandidates(row: []const sampling.Candidate, position: u64, s: ?lanes.Sampling) !u32 {
+    const sm = s orelse return error.BadCandidates;
+    const count = @min(row.len, sm.top_k + sampling.margin); // (the row's own top_k + MARGIN of a wider list)
+    if (count > sampling.max_candidates) return error.BadCandidates;
+    var values: [sampling.max_candidates]f32 = undefined;
+    var ids: [sampling.max_candidates]i64 = undefined;
+    for (row[0..count], 0..) |c, i| {
+        values[i] = c.value;
+        ids[i] = c.id;
+    }
+    const t = try sampling.sampleCandidates(values[0..count], ids[0..count], position, .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p });
+    return @intCast(t);
+}
+
 /// One stream count's sums (Profile.by): the rounds over that many windows, the drafter passes over that many streams.
 pub const Shape = struct {
     rounds: u64 = 0,
@@ -923,7 +949,10 @@ pub const Lanes = struct {
             };
         }
         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
-        const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
+        // sampled rows draw from the device's candidates when every window is sampled (else, or on a NaN: the logits)
+        const width = if (greedy or !m.gpu_candidates) 0 else candidateWidth(windows);
+        const cands: ?[]const sampling.Candidate = if (width > 0) try m.roundCandidates(rows.ids.len, width) else null;
+        const logits: []const f32 = if (greedy or cands != null) &.{} else try m.roundLogits(rows.ids.len);
         const t3 = m.now();
         defer if (self.prof) |*p| {
             const drew = m.now() - t3;
@@ -941,7 +970,7 @@ pub const Lanes = struct {
         const V = m.vocab;
         for (windows, out, 0..) |w, *o, k| {
             const row0 = self.built.wins[k].row;
-            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
+            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else if (cands) |cs| try drawCandidates(cs[(row0 + r) * width ..][0..width], w.positions[r], w.stream.sampling) else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
             const l = self.streams.getPtr(w.stream).?;
             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
@@ -1815,4 +1844,64 @@ test "the shape line is said every shape_every rounds and the sums start over" {
     try std.testing.expectEqual(@as(u64, 0), p.by[3].rounds);
     try std.testing.expectEqual(@as(u64, 0), p.prefills);
     try std.testing.expectEqual(@as(u64, 2), ln.shape_every);
+}
+
+test "device candidates serve a round only when every window is sampled with a top_k the sampler draws" {
+    const gpa = std.testing.allocator;
+    const prompt = [_]u32{ 1, 2, 3 };
+    const settings = [_]?lanes.Sampling{
+        .{ .seed = 1, .temperature = 0.7, .top_k = 20 }, // 28 candidates
+        .{ .seed = 2, .temperature = 1.0, .top_k = 56 }, // 64
+        .{ .seed = 3, .temperature = 0.7, .top_k = 1 }, // 9
+        null, // greedy
+        .{ .seed = 4, .temperature = 0, .top_k = 20 }, // greedy by its temperature
+        .{ .seed = 5, .temperature = 0.7, .top_k = 0 }, // the nucleus path the sampler lacks
+        .{ .seed = 6, .temperature = 0.7, .top_k = 57 }, // past max_top_k
+    };
+    var streams: [settings.len]lanes.Stream = undefined;
+    var windows: [settings.len]be.Window = undefined;
+    var made: usize = 0;
+    defer for (streams[0..made]) |*s| s.deinit(gpa);
+    for (settings, &streams, &windows) |sm, *s, *w| {
+        s.* = try lanes.Stream.init(gpa, .{ .id = "t", .prompt = &prompt, .max_new = 8, .sampling = sm });
+        made += 1;
+        w.* = .{ .stream = s, .pending = 1, .held = 0, .tokens = &.{}, .parents = null, .positions = &.{4} };
+    }
+    try std.testing.expectEqual(@as(usize, 28), candidateWidth(windows[0..1]));
+    try std.testing.expectEqual(@as(usize, 64), candidateWidth(windows[0..2]));
+    try std.testing.expectEqual(@as(usize, 64), candidateWidth(windows[0..3])); // the widest window's
+    try std.testing.expectEqual(@as(usize, 9), candidateWidth(windows[2..3]));
+    for (3..settings.len) |i| try std.testing.expectEqual(@as(usize, 0), candidateWidth(windows[i..][0..1]));
+    // one window the device cannot serve sends the whole round to the logits, and greedy windows never take part
+    for ([_]usize{ 3, 4, 5, 6 }) |other| {
+        const mixed = [_]be.Window{ windows[0], windows[other] };
+        try std.testing.expectEqual(@as(usize, 0), candidateWidth(&mixed));
+    }
+}
+
+test "a sampled row draws the same token from its device candidates as from its logits" {
+    var prng: std.Random.DefaultPrng = .init(0x7a11);
+    const rnd = prng.random();
+    var row: [3000]f32 = undefined;
+    var found: [sampling.max_candidates]f32 = undefined;
+    var at: [sampling.max_candidates]i64 = undefined;
+    var cands: [sampling.max_candidates]sampling.Candidate = undefined;
+    for (0..120) |trial| {
+        for (&row) |*v| v.* = switch (trial % 4) {
+            0 => (rnd.float(f32) - 0.5) * 12,
+            1 => @floatFromInt(rnd.uintLessThan(u32, 7)), // many ties
+            2 => if (rnd.uintLessThan(u32, 2) == 0) -0.0 else 0.0, // zeros of both signs
+            else => if (rnd.uintLessThan(u32, 9) == 0) -std.math.inf(f32) else (rnd.float(f32) - 0.5) * 3,
+        };
+        for ([_]u32{ 1, 20, 56 }) |top_k| {
+            const s: lanes.Sampling = .{ .seed = rnd.int(u64), .temperature = 0.8, .top_k = top_k, .top_p = if (trial % 2 == 0) 0.95 else 1.0, .min_p = if (trial % 3 == 0) 0.05 else 0.0 };
+            const position = rnd.int(u32);
+            // the round's list is as wide as its widest window's: this row's own top_k + MARGIN, or more
+            const width: usize = @min(sampling.max_candidates, top_k + sampling.margin + rnd.uintLessThan(u32, 9));
+            const n = sampling.topCandidates(&row, width, &found, &at);
+            for (cands[0..n], found[0..n], at[0..n]) |*c, v, id| c.* = .{ .value = v, .id = @intCast(id) };
+            try std.testing.expectEqual(try draw(&row, position, s), try drawCandidates(cands[0..n], position, s));
+        }
+    }
+    try std.testing.expectError(error.BadCandidates, drawCandidates(cands[0..8], 1, null));
 }

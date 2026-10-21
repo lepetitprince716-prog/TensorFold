@@ -28,6 +28,7 @@ const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
 const spill = @import("spill.zig");
+const sampling = @import("sampling.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -115,6 +116,11 @@ pub const Model = struct {
     logits: []f32, // round.max_rows rows of logits on the host
     amax: u64, // u32 [round.max_rows]: a round's greedy tokens on the device (roundArgmax)
     amax_host: [round.max_rows]u32 = undefined,
+    gpu_candidates: bool, // TF_DS_GPU_CANDIDATES=1 on rank 0: a sampled round's candidates are selected on the device
+    candidate_scratch: u64, // sampling.Candidate [round.max_rows, vocab tiles, max_candidates]: each tile's list
+    candidate_out: u64, // sampling.Candidate [round.max_rows, max_candidates]: each row's list (roundCandidates)
+    candidate_host: []sampling.Candidate, // candidate_out on the host
+    candidate_nan: u32, // rounds that held a NaN row so far (they draw from the logits; the first few are logged)
     // the stream a fill is running: its slot and its view of the caches (its extent from base)
     fill_slot: usize = 0,
     // the prompt a fill's chunks come from (the caller's, set for the fill) and the thread reading the next chunk's
@@ -299,6 +305,11 @@ pub const Model = struct {
         }
         m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
         m.amax = try m.arena.take(round.max_rows * 4);
+        m.gpu_candidates = false;
+        m.candidate_scratch = 0;
+        m.candidate_out = 0;
+        m.candidate_host = &.{};
+        m.candidate_nan = 0;
         if (o.graphs) m.graphs = round.Graphs.init(gpa);
         if (o.side) try m.rd.useSide(&m.eng);
         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
@@ -348,6 +359,13 @@ pub const Model = struct {
         m.ids64 = try a.alloc(i64, chunk_rows);
         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
+        if (o.rank == 0 and envOn("TF_DS_GPU_CANDIDATES")) {
+            const list = round.max_rows * sampling.max_candidates * @sizeOf(sampling.Candidate);
+            m.candidate_scratch = try m.arena.take(list * ((m.vocab + ops_mod.Ops.candidate_tile - 1) / ops_mod.Ops.candidate_tile));
+            m.candidate_out = try m.arena.take(list);
+            m.candidate_host = try a.alloc(sampling.Candidate, round.max_rows * sampling.max_candidates);
+            m.gpu_candidates = true;
+        }
         return m;
     }
 
@@ -879,6 +897,25 @@ pub const Model = struct {
         try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.rd.logits, R * m.vocab * 4), "cuMemcpyDtoH");
         try m.clockServe();
         return m.logits[0 .. R * m.vocab];
+    }
+
+    /// The round's R rows of k candidates each, selected on the device; null when a row holds a NaN (see roundLogits).
+    pub fn roundCandidates(m: *Model, R: usize, k: usize) !?[]const sampling.Candidate {
+        // (sampling.topCandidates' lists, k at most max_candidates; the logits stay on the device whatever comes back)
+        if (!m.gpu_candidates or R > round.max_rows or k > sampling.max_candidates) return error.BadCandidates;
+        const d = m.ctx.d;
+        try m.ops.candidateRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, k, m.candidate_scratch, m.candidate_out);
+        try m.stream.synchronize();
+        try d.check(d.api.cuMemcpyDtoH_v2(m.candidate_host.ptr, m.candidate_out, R * k * @sizeOf(sampling.Candidate)), "cuMemcpyDtoH candidates");
+        try m.clockServe();
+        const got = m.candidate_host[0 .. R * k];
+        for (got) |c| if (c.id == sampling.nan_row) {
+            if (m.candidate_nan < 4) std.log.warn("dsv41: a NaN in a sampled round's logits; the round is drawn from the host's logits", .{});
+            m.candidate_nan +|= 1;
+            return null;
+        };
+        for (got) |c| if (c.id >= m.vocab) return error.BadCandidates;
+        return got;
     }
 
     /// The prompt's logits on the host (after a fill's last chunk).
