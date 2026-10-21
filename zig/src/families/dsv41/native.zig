@@ -211,6 +211,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadSpillGib, error.BadSpillMin, error.BadSpillStaging => "TF_DS_SPILL_GIB, TF_DS_SPILL_MIN_TOKENS and TF_DS_SPILL_STAGING_MIB take numbers",
         error.SamplingNotSupported => sampling_words,
         error.BadWatchdog => "TF_DS_WATCHDOG_S takes whole seconds (default 120; 0 turns the watchdog off)",
+        error.BadWatchdogStart => "TF_DS_WATCHDOG_START_S takes whole seconds (default 600; 0 leaves the start-up exchange unwatched)",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
         else => null,
     };
@@ -221,5 +222,6 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
     try std.testing.expectEqualStrings("top_k must be 1-56 when sampling", explain(null, error.SamplingNotSupported).?);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadWatchdog).?, "TF_DS_WATCHDOG_S") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadWatchdogStart).?, "TF_DS_WATCHDOG_START_S") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }

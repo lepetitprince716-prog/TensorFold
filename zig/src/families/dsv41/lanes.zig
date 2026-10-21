@@ -529,8 +529,13 @@ pub const Lanes = struct {
         if (try self.begin(kind)) try self.flushLoose();
     }
 
-    pub fn busy(self: *Lanes, name: []const u8) void {
+    fn busy(self: *Lanes, name: []const u8) void {
         if (self.dog) |d| d.busy(name);
+    }
+
+    /// The start-up exchange with rank 1 begins (spill_lanes.zig): a window with its own limit.
+    pub fn busyStartup(self: *Lanes, name: []const u8) void {
+        if (self.dog) |d| d.busyStartup(name);
     }
 
     fn tick(self: *Lanes) void {
@@ -1140,8 +1145,9 @@ fn ringFailed(m: *Model) void {
 /// This rank's watchdog (null: TF_DS_WATCHDOG_S is 0), whose stall breaks the pair; stop it before the model closes.
 pub fn watch(gpa: std.mem.Allocator, io: std.Io, m: *Model) !?*watchdog.Watchdog {
     const limit = try watchdog.limitFromEnv();
+    const start_s = try watchdog.startLimitFromEnv(); // (a typo is refused even when the watchdog is off)
     if (limit == 0) return null;
-    return try watchdog.Watchdog.start(gpa, io, limit, m, stalled);
+    return try watchdog.Watchdog.start(gpa, io, .{ .limit_s = limit, .start_s = start_s }, m, stalled);
 }
 
 fn stalled(ctx: *anyopaque, stall: watchdog.Stall) void {

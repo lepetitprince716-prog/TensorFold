@@ -4,6 +4,12 @@ const std = @import("std");
 /// Seconds a primitive may run without a tick when TF_DS_WATCHDOG_S is unset.
 pub const default_limit_s: u64 = 120;
 
+/// Seconds the start-up exchange may wait for the other rank when TF_DS_WATCHDOG_START_S is unset (a cold model load).
+pub const default_start_s: u64 = 600;
+
+/// What a watchdog is set to, in seconds: a primitive's quiet limit, and the start-up window's (0: unwatched).
+pub const Config = struct { limit_s: u64, start_s: u64 = default_start_s };
+
 /// A primitive that stopped ticking: its name and the seconds since its last progress.
 pub const Stall = struct { name: []const u8, seconds: u64 };
 
@@ -28,34 +34,50 @@ pub fn limitFromEnv() error{BadWatchdog}!u64 {
     return limitFromText(std.mem.span(v));
 }
 
+/// TF_DS_WATCHDOG_START_S as the start-up window's limit in seconds: unset is the default, 0 leaves it unwatched.
+pub fn startLimitFromText(text: ?[]const u8) error{BadWatchdogStart}!u64 {
+    const t = text orelse return default_start_s;
+    if (t.len == 0) return default_start_s;
+    return std.fmt.parseInt(u64, t, 10) catch error.BadWatchdogStart;
+}
+
+pub fn startLimitFromEnv() error{BadWatchdogStart}!u64 {
+    const v = std.c.getenv("TF_DS_WATCHDOG_START_S") orelse return startLimitFromText(null);
+    return startLimitFromText(std.mem.span(v));
+}
+
 pub const Watchdog = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     clock: Clock,
     limit_ns: u64,
+    start_ns: u64 = 0,
     fire_ctx: *anyopaque,
     fire: Fire,
-    /// Guards active, reported, name and since: the primitive's thread writes them, the watchdog's thread reads them.
+    /// Guards active, reported, name, since and window_ns: the primitive's thread writes, the watchdog's thread reads.
     lock: std.atomic.Value(bool) = .init(false),
     active: bool = false,
     reported: bool = false,
     name: []const u8 = "",
     since: u64 = 0,
+    window_ns: u64 = 0,
     stopped: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     sleep_ms: u64 = 100,
     every: u32 = 10,
 
-    /// Starts the watchdog thread: `fire` runs there once a primitive has made no progress for `limit_s` seconds.
-    pub fn start(gpa: std.mem.Allocator, io: std.Io, limit_s: u64, fire_ctx: *anyopaque, fire: Fire) !*Watchdog {
-        return startPaced(gpa, io, limit_s *| std.time.ns_per_s, 100, 10, fire_ctx, fire);
+    /// Starts the watchdog thread: `fire` runs there once a primitive has made no progress for its window's limit.
+    pub fn start(gpa: std.mem.Allocator, io: std.Io, c: Config, fire_ctx: *anyopaque, fire: Fire) !*Watchdog {
+        const ns = std.time.ns_per_s;
+        return spawn(.{ .gpa = gpa, .io = io, .clock = undefined, .limit_ns = c.limit_s *| ns, .start_ns = c.start_s *| ns, .fire_ctx = fire_ctx, .fire = fire });
     }
 
-    /// The thread sleeps `sleep_ms` at a time (so that stop returns at once) and checks every `every` sleeps.
-    fn startPaced(gpa: std.mem.Allocator, io: std.Io, limit_ns: u64, sleep_ms: u64, every: u32, fire_ctx: *anyopaque, fire: Fire) !*Watchdog {
-        const w = try gpa.create(Watchdog);
-        errdefer gpa.destroy(w);
-        w.* = .{ .gpa = gpa, .io = io, .clock = .{ .ctx = w, .now = awake }, .limit_ns = limit_ns, .fire_ctx = fire_ctx, .fire = fire, .sleep_ms = sleep_ms, .every = every };
+    /// A watchdog set up by hand, with its thread: it sleeps `sleep_ms` at a time and checks every `every` sleeps.
+    fn spawn(template: Watchdog) !*Watchdog {
+        const w = try template.gpa.create(Watchdog);
+        errdefer template.gpa.destroy(w);
+        w.* = template;
+        w.clock = .{ .ctx = w, .now = awake };
         w.thread = try std.Thread.spawn(.{}, loop, .{w});
         return w;
     }
@@ -67,8 +89,17 @@ pub const Watchdog = struct {
         w.gpa.destroy(w);
     }
 
-    /// A primitive starts: its window opens now.
+    /// A primitive starts: its window opens now, with the primitive limit.
     pub fn busy(w: *Watchdog, name: []const u8) void {
+        w.open(name, w.limit_ns);
+    }
+
+    /// The start-up exchange starts: a window with its own limit, for a peer that may still be loading (0: unwatched).
+    pub fn busyStartup(w: *Watchdog, name: []const u8) void {
+        w.open(name, w.start_ns);
+    }
+
+    fn open(w: *Watchdog, name: []const u8, limit_ns: u64) void {
         const at = w.clock.now(w.clock.ctx);
         w.acquire();
         defer w.release();
@@ -76,6 +107,7 @@ pub const Watchdog = struct {
         w.reported = false;
         w.name = name;
         w.since = at;
+        w.window_ns = limit_ns;
     }
 
     /// The primitive made progress (a prompt chunk, a round): its window restarts. Idle: nothing to restart.
@@ -95,15 +127,15 @@ pub const Watchdog = struct {
         w.active = false;
     }
 
-    /// The busy primitive that has not ticked for the limit, reported once until it ticks again; null: none.
+    /// The busy primitive that has not ticked for its window's limit, reported once until it ticks again; null: none.
     pub fn check(w: *Watchdog) ?Stall {
         if (w.limit_ns == 0) return null;
         const at = w.clock.now(w.clock.ctx);
         w.acquire();
         defer w.release();
-        if (!w.active or w.reported) return null;
+        if (!w.active or w.reported or w.window_ns == 0) return null;
         const quiet = at -| w.since;
-        if (quiet < w.limit_ns) return null;
+        if (quiet < w.window_ns) return null;
         w.reported = true;
         return .{ .name = w.name, .seconds = quiet / std.time.ns_per_s };
     }
@@ -155,7 +187,7 @@ fn never(_: *anyopaque, _: Stall) void {}
 
 /// A watchdog on the fake clock, no thread.
 fn watcher(f: *Fake, limit_s: u64) Watchdog {
-    return .{ .gpa = testing.allocator, .io = testing.io, .clock = f.clock(), .limit_ns = limit_s * sec, .fire_ctx = f, .fire = never };
+    return .{ .gpa = testing.allocator, .io = testing.io, .clock = f.clock(), .limit_ns = limit_s * sec, .start_ns = default_start_s * sec, .fire_ctx = f, .fire = never };
 }
 
 test "a primitive with no tick fires at the limit and not a second before, once" {
@@ -232,6 +264,53 @@ test "a limit of 0 is off" {
     try testing.expect(w.check() == null);
 }
 
+test "the start-up window has its own limit, and the next ordinary window is back to the primitive limit" {
+    var f: Fake = .{};
+    var w = watcher(&f, 120);
+    w.busyStartup("spill_sync");
+    f.at += 599 * sec; // past the primitive limit, inside the start-up one
+    try testing.expect(w.check() == null);
+    f.at += sec;
+    const stall = w.check().?;
+    try testing.expectEqualStrings("spill_sync", stall.name);
+    try testing.expectEqual(@as(u64, 600), stall.seconds);
+    w.idle();
+    w.busy("verify");
+    f.at += 119 * sec;
+    try testing.expect(w.check() == null);
+    f.at += sec;
+    try testing.expectEqual(@as(u64, 120), w.check().?.seconds);
+    w.busyStartup("spill_sync"); // a tick restarts the start-up window at its own limit too
+    f.at += 599 * sec;
+    w.tick();
+    f.at += 599 * sec;
+    try testing.expect(w.check() == null);
+}
+
+test "a start-up limit of 0 leaves that window unwatched and the others as they are" {
+    var f: Fake = .{};
+    var w = watcher(&f, 120);
+    w.start_ns = 0;
+    w.busyStartup("spill_sync");
+    f.at += 100000 * sec;
+    try testing.expect(w.check() == null);
+    w.busy("verify");
+    f.at += 120 * sec;
+    try testing.expectEqualStrings("verify", w.check().?.name);
+    var off = watcher(&f, 0); // the watchdog off is off for the start-up window too
+    off.busyStartup("spill_sync");
+    f.at += 100000 * sec;
+    try testing.expect(off.check() == null);
+}
+
+test "the start-up limit's text: unset or empty is 600 s, 0 is unwatched, anything else but whole seconds is refused" {
+    try testing.expectEqual(@as(u64, 600), try startLimitFromText(null));
+    try testing.expectEqual(@as(u64, 600), try startLimitFromText(""));
+    try testing.expectEqual(@as(u64, 0), try startLimitFromText("0"));
+    try testing.expectEqual(@as(u64, 1800), try startLimitFromText("1800"));
+    for ([_][]const u8{ "x", "-3", "1.5", "10m", " 5" }) |bad| try testing.expectError(error.BadWatchdogStart, startLimitFromText(bad));
+}
+
 test "the limit's text: unset or empty is 120 s, 0 is off, anything else but whole seconds is refused" {
     try testing.expectEqual(@as(u64, 120), try limitFromText(null));
     try testing.expectEqual(@as(u64, 120), try limitFromText(""));
@@ -242,7 +321,7 @@ test "the limit's text: unset or empty is 120 s, 0 is off, anything else but who
 
 test "the thread starts and stops with nothing stalled" {
     var ctx: u8 = 0;
-    const w = try Watchdog.start(testing.allocator, testing.io, 3600, &ctx, never);
+    const w = try Watchdog.start(testing.allocator, testing.io, .{ .limit_s = 3600 }, &ctx, never);
     w.busy("verify");
     w.tick();
     w.idle();
@@ -276,7 +355,7 @@ const Fires = struct {
 
 test "the thread fires once for a stalled primitive, again after a tick, and not while idle (the real clock)" {
     var fires: Fires = .{};
-    const w = try Watchdog.startPaced(testing.allocator, testing.io, 40 * std.time.ns_per_ms, 5, 2, &fires, Fires.fire);
+    const w = try Watchdog.spawn(.{ .gpa = testing.allocator, .io = testing.io, .clock = undefined, .limit_ns = 40 * std.time.ns_per_ms, .fire_ctx = &fires, .fire = Fires.fire, .sleep_ms = 5, .every = 2 });
     w.busy("verify");
     try fires.wait(1);
     try testing.expectEqualStrings("verify", fires.last);
