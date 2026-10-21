@@ -1105,11 +1105,17 @@ pub fn pairBroken(m: *Model, why: []const u8) void {
     std.c._exit(75);
 }
 
-/// A CUDA failure is sticky (this rank fails every later primitive): from any primitive it breaks the pair.
+/// Why a CUDA failure ends the pair, else null (it is this primitive's alone): a sticky context fails the probe too.
+fn cudaEnds(buf: []u8, what: []const u8, rank: u32, probe: anyerror!bool) ?[]const u8 {
+    _ = probe catch return std.fmt.bufPrint(buf, "{s}: CudaFailed on rank {d}, its context fails too", .{ what, rank }) catch "CudaFailed";
+    return null;
+}
+
+/// A CUDA failure breaks the pair if the context fails too; else it is a refusal and the outcome check decides.
 fn cudaFailed(m: *Model, err: anyerror, what: []const u8) void {
     if (err != error.CudaFailed) return;
-    var buf: [64]u8 = undefined;
-    pairBroken(m, std.fmt.bufPrint(&buf, "{s}: CudaFailed on rank {d}", .{ what, m.rank }) catch "CudaFailed");
+    var buf: [96]u8 = undefined;
+    if (cudaEnds(&buf, what, m.rank, m.stream.done())) |why| pairBroken(m, why); // (one stream query: it never blocks)
 }
 
 /// A primitive's result, passed on as it is; a CUDA failure in it, or a ring that failed, first breaks the pair.
@@ -1447,6 +1453,56 @@ test "the pair_broken line is one JSON object, whatever the reason's text" {
     var small: [24]u8 = undefined;
     const cut = jsonLine(&small, "pair_broken", "a reason too long for the buffer");
     try std.testing.expect(std.mem.endsWith(u8, cut, "\"}\n") and cut.len <= small.len);
+}
+
+test "a CUDA failure ends the pair only when its context fails the probe too" {
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("verify: CudaFailed on rank 1, its context fails too", cudaEnds(&buf, "verify", 1, error.CudaFailed).?);
+    try std.testing.expect(cudaEnds(&buf, "verify", 1, false) == null); // work still queued: the context answers
+    try std.testing.expect(cudaEnds(&buf, "verify", 1, true) == null); // everything finished: it answers
+    var small: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("CudaFailed", cudaEnds(&small, "verify", 1, error.CudaFailed).?); // (a reason too long to keep)
+}
+
+test "a CUDA failure its context survives is a refusal the next frame's check settles; one it does not ends the pair" {
+    var buf: [96]u8 = undefined;
+    const refusal = cudaEnds(&buf, "verify", 0, false) == null; // what such a failure makes of this rank's half
+    try std.testing.expect(refusal);
+    var f: FakeWire = .{};
+    defer f.deinit();
+    try std.testing.expect(try f.frame(.verify, refusal, refusal) == null); // both ranks fail it: the request fails, no more
+    try std.testing.expect(try f.frame(.verify, false, false) == null);
+    try std.testing.expect(try f.frame(.verify, refusal, false) == null); // rank 0 alone: its next frame carries the failure
+    try std.testing.expect(try f.frame(.verify, false, false) != null); // and rank 1 finds the ranks apart
+    try std.testing.expect(try f.frame(.verify, false, refusal) == null); // rank 1 alone: it holds the refusal till then
+    try std.testing.expect(try f.frame(.verify, false, false) != null); // where rank 0's done differs
+    try std.testing.expect(cudaEnds(&buf, "verify", 0, error.CudaFailed) != null); // a broken context: no next frame to wait for
+}
+
+test "cudaFailed probes the context once for a CUDA failure and never for another error, and a sound context goes on" {
+    const Probe = struct {
+        code: cuda.abi.Result,
+        calls: u32 = 0,
+
+        fn query(h: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            const p: *@This() = @ptrCast(@alignCast(h.?));
+            p.calls += 1;
+            return p.code;
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuStreamQuery = &Probe.query;
+    for ([_]cuda.abi.Result{ cuda.abi.success, cuda.abi.error_not_ready }) |code| {
+        var p: Probe = .{ .code = code };
+        var m: Model = undefined;
+        m.rank = 1;
+        m.stream = .{ .d = &d, .handle = @ptrCast(&p) };
+        cudaFailed(&m, error.OutOfDeviceMemory, "verify");
+        cudaFailed(&m, error.NotReady, "verify");
+        try std.testing.expectEqual(@as(u32, 0), p.calls);
+        cudaFailed(&m, error.CudaFailed, "verify"); // a sound context: this returns (a broken pair would have exited 75)
+        try std.testing.expectEqual(@as(u32, 1), p.calls);
+    }
 }
 
 test "a round's rows: each window at its positions, its ids written over the rejected rows" {
