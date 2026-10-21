@@ -165,3 +165,39 @@ test "hashed records match only their own prefix, beside token records, across a
     try std.testing.expectEqual(@as(u32, 3), im.best(&near, &.{}, false, 0).?.at);
     try std.testing.expect(im.best(&long, &.{}, false, 6) == null);
 }
+
+test "a state on disk too near the prompt's end for the family's tail is passed over" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [128]u8 = undefined;
+    const root = try scratch(&buf, "tail");
+    defer rmTree(root);
+    var im = try Imprint.open(gpa, root, 4, 1 << 30);
+    defer im.deinit();
+    const tailed: pc.Rules = .{ .min_prompt = 0, .min_gap = 1, .tail = 3 };
+    const c1 = [_]u32{ 1, 2, 3, 4, 5, 9, 9, 9 }; // history 5: 5 + 3 <= 8, kept
+    {
+        var f: Fake = .{ .gpa = gpa };
+        var s = Store.init(gpa, f.learned(), tailed, 1 << 20);
+        defer s.deinit();
+        s.imprint = &im;
+        s.spill = true;
+        try std.testing.expectEqual(fresh(&c1), f.pass(&s, &c1, try s.begin(a, &c1, 5, &.{}, &.{}, null)));
+        try std.testing.expect(im.has(Imprint.keyOf(c1[0..5])));
+    }
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.learned(), tailed, 1 << 20);
+    defer s.deinit();
+    s.imprint = &im;
+    s.spill = true;
+    const near = c1[0..5].* ++ [_]u32{ 7, 7 }; // 5 + 3 > 7: a fresh pass
+    var p = try s.begin(a, &near, 0, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 0), p.from);
+    try std.testing.expectEqual(fresh(&near), f.pass(&s, &near, p));
+    const far = c1[0..5].* ++ [_]u32{ 7, 7, 7 }; // 5 + 3 <= 8: from disk
+    p = try s.begin(a, &far, 0, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 5), p.from);
+    try std.testing.expectEqual(fresh(&far), f.pass(&s, &far, p));
+}

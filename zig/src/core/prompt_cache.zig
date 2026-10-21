@@ -361,7 +361,8 @@ pub const Store = struct {
     fn recall(s: *Store, prompt: []const u32, starts: []const u32, have: ?*Entry) ?*Entry {
         const im = s.imprint orelse return have;
         const read = s.family.vtable.read orelse return have;
-        const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
+        const upto = if (s.rules.tail == 0) prompt else prompt[0..(prompt.len + 1) -| s.rules.tail]; // `tail` left past it
+        const m = im.best(upto, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
         const read_ = m.read(); // a hashed state's tokens are the prompt's (best matched them)
         const tokens = if (m.hashed()) prompt[0..read_] else m.tokens;
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
