@@ -672,8 +672,8 @@ pub const Model = struct {
     /// One round over every stream's window (rows.windows, each with its stream's slot and extent), then each window
     /// whose stream drafts has its rows' taps absorbed into its slot's drafter rings at its positions (the served
     /// eager absorb: rows past the ones the round keeps sit where the drafter never reads, and the next window
-    /// overwrites them). absorb[i]: window i's stream drafts.
-    pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool) !void {
+    /// overwrites them). absorb[i]: window i's stream drafts. wait: the stream drained before returning.
+    pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool, wait: bool) !void {
         const e = &m.eng;
         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
         const t0 = m.now();
@@ -708,7 +708,8 @@ pub const Model = struct {
             }
             if (n > 0) try dr.absorbMany(e, &m.ch, &m.dpool.?, items[0..n]);
         }
-        try m.stream.synchronize();
+        // wait false: the caller's read next (roundArgmax, roundLogits) waits, so the argmax queues with no idle gap
+        if (wait or m.prof) try m.stream.synchronize();
         if (m.prof) m.t_absorb = m.now() - t1;
     }
 

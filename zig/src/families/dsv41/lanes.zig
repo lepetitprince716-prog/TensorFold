@@ -671,7 +671,7 @@ pub const Lanes = struct {
         }
         const t1 = m.now();
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
-        try m.verify(rows, self.built.absorb[0..windows.len]);
+        try m.verify(rows, self.built.absorb[0..windows.len], false); // roundArgmax / roundLogits wait next
         const t2 = m.now();
         // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
         var greedy = true;
@@ -1001,7 +1001,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     wins[k] = .{ .slot = s, .base = base, .end = end, .start = start, .absorb = absorb, .ids = win_ids[k].items };
                 }
                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
-                m.verify(rows, built.absorb[0..nw]) catch |err| refused(err);
+                m.verify(rows, built.absorb[0..nw], true) catch |err| refused(err);
                 if (m.prof) {
                     follow_prof.rounds += 1;
                     follow_prof.enqueue += m.t_enqueue;
