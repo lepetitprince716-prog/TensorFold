@@ -1147,7 +1147,18 @@ pub fn watch(gpa: std.mem.Allocator, io: std.Io, m: *Model) !?*watchdog.Watchdog
     const limit = try watchdog.limitFromEnv();
     const start_s = try watchdog.startLimitFromEnv(); // (a typo is refused even when the watchdog is off)
     if (limit == 0) return null;
-    return try watchdog.Watchdog.start(gpa, io, .{ .limit_s = limit, .start_s = start_s }, m, stalled);
+    var fds: [watchdog.max_peers]std.c.fd_t = undefined;
+    var n: usize = 0;
+    for (m.followers()) |l| if (l) |k| if (n < fds.len) {
+        fds[n] = k.fd;
+        n += 1;
+    };
+    return try watchdog.Watchdog.start(gpa, io, .{ .limit_s = limit, .start_s = start_s, .peers = fds[0..n], .hangup = peerGone }, m, stalled);
+}
+
+/// A peer's link hung up with nothing left to read: its rank is gone, and a primitive waiting on it would never end.
+fn peerGone(ctx: *anyopaque) void {
+    pairBroken(@ptrCast(@alignCast(ctx)), "peer hung up");
 }
 
 fn stalled(ctx: *anyopaque, stall: watchdog.Stall) void {

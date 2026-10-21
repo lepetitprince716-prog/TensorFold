@@ -1,5 +1,6 @@
-//! A rank's watchdog: a busy primitive that makes no progress for the limit ends its pair (lanes.zig pairBroken).
+//! A rank's watchdog: a primitive with no progress for the limit, or a peer that hung up, ends its pair (lanes.zig).
 const std = @import("std");
+const posix = std.posix;
 
 /// Seconds a primitive may run without a tick when TF_DS_WATCHDOG_S is unset.
 pub const default_limit_s: u64 = 120;
@@ -7,14 +8,20 @@ pub const default_limit_s: u64 = 120;
 /// Seconds the start-up exchange may wait for the other rank when TF_DS_WATCHDOG_START_S is unset (a cold model load).
 pub const default_start_s: u64 = 600;
 
-/// What a watchdog is set to, in seconds: a primitive's quiet limit, and the start-up window's (0: unwatched).
-pub const Config = struct { limit_s: u64, start_s: u64 = default_start_s };
+/// What a watchdog is set to: the quiet limits in seconds (0: unwatched) and the links whose hangup goes to `hangup`.
+pub const Config = struct { limit_s: u64, start_s: u64 = default_start_s, peers: []const std.c.fd_t = &.{}, hangup: ?Hangup = null };
 
 /// A primitive that stopped ticking: its name and the seconds since its last progress.
 pub const Stall = struct { name: []const u8, seconds: u64 };
 
 /// What the watchdog thread calls when a primitive stalls.
 pub const Fire = *const fn (ctx: *anyopaque, stall: Stall) void;
+
+/// What the watchdog thread calls, once, when a peer's link has hung up.
+pub const Hangup = *const fn (ctx: *anyopaque) void;
+
+/// The most links a watchdog watches (rank 0 of the four-node split has three).
+pub const max_peers = 4;
 
 /// Where the watchdog reads time: nanoseconds on a monotonic clock (a test sets its own by hand).
 pub const Clock = struct {
@@ -61,6 +68,10 @@ pub const Watchdog = struct {
     name: []const u8 = "",
     since: u64 = 0,
     window_ns: u64 = 0,
+    peers: [max_peers]std.c.fd_t = undefined,
+    npeers: usize = 0,
+    hangup: ?Hangup = null,
+    hung: bool = false, // the thread's own: a hangup is said once
     stopped: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     sleep_ms: u64 = 100,
@@ -69,7 +80,10 @@ pub const Watchdog = struct {
     /// Starts the watchdog thread: `fire` runs there once a primitive has made no progress for its window's limit.
     pub fn start(gpa: std.mem.Allocator, io: std.Io, c: Config, fire_ctx: *anyopaque, fire: Fire) !*Watchdog {
         const ns = std.time.ns_per_s;
-        return spawn(.{ .gpa = gpa, .io = io, .clock = undefined, .limit_ns = c.limit_s *| ns, .start_ns = c.start_s *| ns, .fire_ctx = fire_ctx, .fire = fire });
+        var w: Watchdog = .{ .gpa = gpa, .io = io, .clock = undefined, .limit_ns = c.limit_s *| ns, .start_ns = c.start_s *| ns, .fire_ctx = fire_ctx, .fire = fire, .hangup = c.hangup };
+        w.npeers = @min(c.peers.len, max_peers);
+        @memcpy(w.peers[0..w.npeers], c.peers[0..w.npeers]);
+        return spawn(w);
     }
 
     /// A watchdog set up by hand, with its thread: it sleeps `sleep_ms` at a time and checks every `every` sleeps.
@@ -162,9 +176,33 @@ pub const Watchdog = struct {
             slices = 0; // a check every second by default, the sleeps short so that stop returns at once
             if (w.stopped.load(.acquire)) break;
             if (w.check()) |stall| w.fire(w.fire_ctx, stall);
+            if (!w.hung and hungUp(w.peers[0..w.npeers])) {
+                w.hung = true; // said once: the link stays hung up, and with TF_DS_PAIR_BROKEN=log the callback returns
+                if (w.hangup) |gone| gone(w.fire_ctx);
+            }
         }
     }
 };
+
+/// What poll asks for: the peer's close (Linux), or readable (EOF is that; elsewhere POLLRDHUP does not exist).
+const hangup_events: i16 = if (@hasDecl(posix.POLL, "RDHUP")) posix.POLL.RDHUP else posix.POLL.IN;
+
+/// Whether a peer closed one of `fds` with nothing left to read (poll, then a peek that takes nothing off the stream).
+pub fn hungUp(fds: []const std.c.fd_t) bool {
+    for (fds) |fd| {
+        var p = [_]posix.pollfd{.{ .fd = fd, .events = hangup_events, .revents = 0 }};
+        const ready = posix.poll(&p, 0) catch continue;
+        if (ready == 0 or p[0].revents & (hangup_events | posix.POLL.HUP | posix.POLL.ERR) == 0) continue;
+        var probe: [1]u8 = undefined;
+        const rc = posix.system.recvfrom(fd, &probe, 1, posix.MSG.PEEK | posix.MSG.DONTWAIT, null, null);
+        switch (posix.errno(rc)) {
+            .SUCCESS => if (rc == 0) return true,
+            .AGAIN, .INTR => {},
+            else => return true,
+        }
+    }
+    return false;
+}
 
 const testing = std.testing;
 const sec = std.time.ns_per_s;
@@ -365,4 +403,117 @@ test "the thread fires once for a stalled primitive, again after a tick, and not
     w.idle();
     try fires.settle(2);
     Watchdog.stop(w);
+}
+
+/// A connected pair of stream sockets: a socketpair, or loopback TCP as the ranks' link is (a close is a FIN there).
+const Kind = enum { unix, tcp };
+
+fn socketPair(kind: Kind) ![2]std.c.fd_t {
+    var pair: [2]std.c.fd_t = undefined;
+    if (kind == .unix) {
+        if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
+        return pair;
+    }
+    const listener = std.c.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    if (listener < 0) return error.Socket;
+    defer _ = std.c.close(listener);
+    var a: std.c.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+    var len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.bind(listener, @ptrCast(&a), len) != 0 or std.c.listen(listener, 1) != 0) return error.Listen;
+    if (std.c.getsockname(listener, @ptrCast(&a), &len) != 0) return error.Listen;
+    pair[0] = std.c.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    if (pair[0] < 0) return error.Socket;
+    errdefer _ = std.c.close(pair[0]);
+    if (std.c.connect(pair[0], @ptrCast(&a), len) != 0) return error.Connect;
+    pair[1] = std.c.accept(listener, null, null);
+    if (pair[1] < 0) return error.Accept;
+    return pair;
+}
+
+test "hungUp: an open idle peer is not a hangup; a closed one is once nothing is left to read (socketpair and TCP)" {
+    for ([_]Kind{ .unix, .tcp }) |kind| {
+        const p = try socketPair(kind);
+        defer _ = std.c.close(p[0]);
+        const q = try socketPair(kind);
+        defer _ = std.c.close(q[0]);
+        defer _ = std.c.close(q[1]);
+        try testing.expect(!hungUp(&.{}));
+        try testing.expect(!hungUp(&.{p[0]})); // open and idle
+        _ = std.c.write(p[1], "done", 4);
+        try testing.expect(!hungUp(&.{p[0]})); // open, a frame waiting
+        _ = std.c.close(p[1]);
+        try testing.expect(!hungUp(&.{p[0]})); // closed with the frame unread: its reader goes first
+        var buf: [4]u8 = undefined;
+        try testing.expectEqual(@as(isize, 4), std.c.read(p[0], &buf, 4));
+        try testing.expect(hungUp(&.{p[0]})); // read: nothing left
+        try testing.expect(hungUp(&.{ q[0], p[0] })); // any of the links
+        try testing.expect(!hungUp(&.{q[0]}));
+    }
+}
+
+/// What the hangup calls leave behind, for the tests that run the thread on the real clock.
+const Hangups = struct {
+    n: std.atomic.Value(u32) = .init(0),
+
+    fn gone(ctx: *anyopaque) void {
+        const h: *Hangups = @ptrCast(@alignCast(ctx));
+        _ = h.n.fetchAdd(1, .release);
+    }
+
+    fn wait(h: *const Hangups, want: u32) !void {
+        for (0..1000) |_| { // up to 5 s
+            if (h.n.load(.acquire) >= want) return;
+            std.Io.sleep(testing.io, .fromMilliseconds(5), .awake) catch {};
+        }
+        return error.Timeout;
+    }
+
+    fn settle(h: *const Hangups, want: u32) !void {
+        std.Io.sleep(testing.io, .fromMilliseconds(120), .awake) catch {};
+        try testing.expectEqual(want, h.n.load(.acquire));
+    }
+};
+
+/// A watchdog on the real clock, paced for a test, that watches the link `fd`.
+fn watching(fd: std.c.fd_t, h: *Hangups, sleep_ms: u64, every: u32) !*Watchdog {
+    var t: Watchdog = .{ .gpa = testing.allocator, .io = testing.io, .clock = undefined, .limit_ns = 3600 * sec, .fire_ctx = h, .fire = never, .hangup = Hangups.gone, .sleep_ms = sleep_ms, .every = every };
+    t.peers[0] = fd;
+    t.npeers = 1;
+    return Watchdog.spawn(t);
+}
+
+test "the thread calls the hangup once for a peer that closed, never for an open idle one, and waits for unread frames" {
+    const idle = try socketPair(.unix);
+    defer _ = std.c.close(idle[0]);
+    defer _ = std.c.close(idle[1]);
+    const shut = try socketPair(.unix);
+    defer _ = std.c.close(shut[0]);
+    var quiet: Hangups = .{};
+    var loud: Hangups = .{};
+    const a = try watching(idle[0], &quiet, 5, 2);
+    defer Watchdog.stop(a);
+    const b = try watching(shut[0], &loud, 5, 2);
+    defer Watchdog.stop(b);
+    try loud.settle(0); // a dozen polls with both peers open
+    _ = std.c.write(shut[1], "done", 4);
+    _ = std.c.close(shut[1]);
+    try loud.settle(0); // closed with a frame unread: the thread leaves it to its reader
+    var buf: [4]u8 = undefined;
+    _ = std.c.read(shut[0], &buf, 4);
+    try loud.wait(1);
+    try loud.settle(1); // said once
+    try quiet.settle(0);
+}
+
+test "at its own pace the thread sees a peer's close within about a second (loopback TCP, the link's kind)" {
+    const p = try socketPair(.tcp);
+    defer _ = std.c.close(p[0]);
+    var h: Hangups = .{};
+    const w = try Watchdog.start(testing.allocator, testing.io, .{ .limit_s = 3600, .peers = &.{p[0]}, .hangup = Hangups.gone }, &h, never);
+    defer Watchdog.stop(w);
+    const t0 = std.Io.Timestamp.now(testing.io, .awake).nanoseconds;
+    _ = std.c.close(p[1]);
+    try h.wait(1);
+    const waited_ms = @divTrunc(std.Io.Timestamp.now(testing.io, .awake).nanoseconds - t0, std.time.ns_per_ms);
+    try testing.expect(waited_ms <= 2500); // one period, 1 s, and a margin for a busy machine
 }
