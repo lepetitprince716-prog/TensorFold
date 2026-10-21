@@ -2,12 +2,32 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// One state on disk: the tokens it read (position plus lookahead), the chunk starts below it, and its bytes.
-pub const Meta = struct { key: u64, at: u32, tokens: []u32, starts: []u32, bytes: u64, used: u64 = 0 };
+/// One state on disk: its tokens (position plus lookahead; hashed: their count and checkOf), chunk starts, bytes.
+pub const Meta = struct {
+    key: u64,
+    at: u32,
+    tokens: []u32,
+    starts: []u32,
+    bytes: u64,
+    used: u64 = 0,
+    n: u32 = 0,
+    check: u64 = 0,
+
+    /// The tokens it read: its own, or a hashed state's count.
+    pub fn read(x: Meta) u32 {
+        return if (x.tokens.len > 0) @intCast(x.tokens.len) else x.n;
+    }
+
+    pub fn hashed(x: Meta) bool {
+        return x.tokens.len == 0 and x.n > 0;
+    }
+};
 
 const MAGIC: u32 = 0x494d5052; // "IMPR"
 const VERSION: u32 = 2;
+const HASHED: u32 = 3; // a record's version when it holds the tokens' count and check instead of the tokens
 const HEAD = 9; // a record's words before its tokens: magic, version, key (2), at, token and start counts, bytes (2)
+const CHECK_SEED: u64 = 0x5ec0_9d17;
 
 pub const Imprint = struct {
     gpa: Allocator,
@@ -49,6 +69,11 @@ pub const Imprint = struct {
         return std.hash.Wyhash.hash(0x1e47, std.mem.sliceAsBytes(tokens));
     }
 
+    /// A hashed state's second hash of its tokens: with `keyOf` 128 bits name them.
+    pub fn checkOf(tokens: []const u32) u64 {
+        return std.hash.Wyhash.hash(CHECK_SEED, std.mem.sliceAsBytes(tokens));
+    }
+
     fn find(m: *const Imprint, key: u64) ?usize {
         for (m.metas.items, 0..) |x, i| if (x.key == key) return i;
         return null;
@@ -82,11 +107,14 @@ pub const Imprint = struct {
 
     /// The longest learned state `prompt` resumes: its tokens a prefix, a row left, `starts` below it the prompt's own.
     pub fn best(m: *const Imprint, prompt: []const u32, starts: []const u32, planned: bool, longer_than: u32) ?*const Meta {
+        var sums = Prefixes.of(m, prompt, longer_than);
+        defer sums.deinit(m.gpa);
         var out: ?*const Meta = null;
         for (m.metas.items) |*x| {
-            if (x.at <= longer_than or x.tokens.len > prompt.len or x.at >= prompt.len) continue;
+            const n = x.read();
+            if (x.at <= longer_than or n > prompt.len or x.at >= prompt.len) continue;
             if (out != null and x.at <= out.?.at) continue;
-            if (!std.mem.eql(u32, prompt[0..x.tokens.len], x.tokens)) continue;
+            if (if (x.hashed()) !sums.match(n, x.key, x.check) else !std.mem.eql(u32, prompt[0..n], x.tokens)) continue;
             if (planned and !sameBelow(starts, x.starts, x.at)) continue;
             out = x;
         }
@@ -102,20 +130,32 @@ pub const Imprint = struct {
 
     /// Record a state its family has written (`bytes` on this Mac): an index record, fsynced, then the entry.
     pub fn add(m: *Imprint, key: u64, at: u32, tokens: []const u32, starts: []const u32, bytes: u64) !void {
+        return m.addAs(false, key, at, tokens, starts, bytes);
+    }
+
+    /// add without the tokens in the index or in memory (their count and checkOf): a long state's record stays small.
+    pub fn addHashed(m: *Imprint, key: u64, at: u32, tokens: []const u32, starts: []const u32, bytes: u64) !void {
+        return m.addAs(true, key, at, tokens, starts, bytes);
+    }
+
+    fn addAs(m: *Imprint, hashed_: bool, key: u64, at: u32, tokens: []const u32, starts: []const u32, bytes: u64) !void {
         if (m.has(key)) return;
         const below = cut(starts, at);
+        const t = try m.gpa.dupe(u32, if (hashed_) &.{} else tokens);
+        errdefer m.gpa.free(t);
+        const s = try m.gpa.dupe(u32, below);
+        errdefer m.gpa.free(s);
+        const x: Meta = .{ .key = key, .at = at, .tokens = t, .starts = s, .bytes = bytes, .n = @intCast(tokens.len), .check = if (hashed_) checkOf(tokens) else 0 };
         var path: [1100]u8 = undefined;
         const fd = std.c.open(try std.fmt.bufPrintSentinel(&path, "{s}/index", .{m.dir}, 0), .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }, @as(std.c.mode_t, 0o600));
         if (fd < 0) return error.ImprintWrite;
         defer _ = std.c.close(fd);
-        try record(fd, key, at, tokens, below, bytes);
+        try record(fd, x);
         if (std.c.fsync(fd) != 0) return error.ImprintWrite;
-        const t = try m.gpa.dupe(u32, tokens);
-        errdefer m.gpa.free(t);
-        const s = try m.gpa.dupe(u32, below);
-        errdefer m.gpa.free(s);
         m.clock += 1;
-        try m.metas.append(m.gpa, .{ .key = key, .at = at, .tokens = t, .starts = s, .bytes = bytes, .used = m.clock });
+        var y = x;
+        y.used = m.clock;
+        try m.metas.append(m.gpa, y);
     }
 
     /// Forget state `key`: the index is rewritten without it (its family removes the files).
@@ -129,7 +169,7 @@ pub const Imprint = struct {
         if (fd < 0) return error.ImprintWrite;
         {
             defer _ = std.c.close(fd);
-            for (m.metas.items) |x| try record(fd, x.key, x.at, x.tokens, x.starts, x.bytes);
+            for (m.metas.items) |x| try record(fd, x);
             if (std.c.fsync(fd) != 0) return error.ImprintWrite;
         }
         if (std.c.rename(tmp, try std.fmt.bufPrintSentinel(&path, "{s}/index", .{m.dir}, 0)) != 0) return error.ImprintWrite;
@@ -143,19 +183,22 @@ pub const Imprint = struct {
         defer _ = std.c.close(fd);
         var off: u64 = 0;
         while (true) {
-            var head: [HEAD]u32 = undefined;
-            if (!readAt(fd, std.mem.sliceAsBytes(&head), off) or head[0] != MAGIC or head[1] != VERSION) return;
+            var head: [HEAD + 2]u32 = undefined;
+            if (!readAt(fd, std.mem.sliceAsBytes(head[0..HEAD]), off) or head[0] != MAGIC or (head[1] != VERSION and head[1] != HASHED)) return;
+            const hashed_ = head[1] == HASHED;
+            if (hashed_ and !readAt(fd, std.mem.sliceAsBytes(head[HEAD..]), off + 4 * HEAD)) return;
             const n: usize = head[5];
             const k: usize = head[6];
             if (n > 1 << 22 or k > n) return;
-            const t = try m.gpa.alloc(u32, n);
+            const stored: usize = if (hashed_) 0 else n; // tokens in the record
+            const t = try m.gpa.alloc(u32, stored);
             const s = m.gpa.alloc(u32, k) catch |err| {
                 m.gpa.free(t);
                 return err;
             };
-            const at = off + @sizeOf(@TypeOf(head));
-            const x: Meta = .{ .key = word64(head[2..4]), .at = head[4], .tokens = t, .starts = s, .bytes = word64(head[7..9]) };
-            if (!readAt(fd, std.mem.sliceAsBytes(t), at) or !readAt(fd, std.mem.sliceAsBytes(s), at + 4 * n)) return free(m.gpa, x);
+            const at = off + 4 * @as(u64, if (hashed_) HEAD + 2 else HEAD);
+            const x: Meta = .{ .key = word64(head[2..4]), .at = head[4], .tokens = t, .starts = s, .bytes = word64(head[7..9]), .n = @intCast(n), .check = if (hashed_) word64(head[9..11]) else 0 };
+            if (!readAt(fd, std.mem.sliceAsBytes(t), at) or !readAt(fd, std.mem.sliceAsBytes(s), at + 4 * stored)) return free(m.gpa, x);
             if (m.has(x.key)) free(m.gpa, x) else {
                 m.clock += 1;
                 var y = x;
@@ -165,7 +208,7 @@ pub const Imprint = struct {
                     return err;
                 };
             }
-            off = at + 4 * (n + k);
+            off = at + 4 * (stored + k);
         }
     }
 
@@ -180,13 +223,58 @@ pub const Imprint = struct {
     }
 };
 
-/// One index record: its head, its tokens, then the chunk starts below its position.
-fn record(fd: c_int, key: u64, at: u32, tokens: []const u32, starts: []const u32, bytes: u64) !void {
-    const head = [HEAD]u32{ MAGIC, VERSION, @truncate(key), @truncate(key >> 32), at, @intCast(tokens.len), @intCast(starts.len), @truncate(bytes), @truncate(bytes >> 32) };
-    try writeAll(fd, std.mem.sliceAsBytes(&head));
-    try writeAll(fd, std.mem.sliceAsBytes(tokens));
-    try writeAll(fd, std.mem.sliceAsBytes(starts));
+/// One index record: its head, its tokens (a hashed one's check instead), then the chunk starts below its position.
+fn record(fd: c_int, x: Meta) !void {
+    const h = x.hashed();
+    const head = [HEAD + 2]u32{ MAGIC, if (h) HASHED else VERSION, @truncate(x.key), @truncate(x.key >> 32), x.at, x.read(), @intCast(x.starts.len), @truncate(x.bytes), @truncate(x.bytes >> 32), @truncate(x.check), @truncate(x.check >> 32) };
+    try writeAll(fd, std.mem.sliceAsBytes(head[0..if (h) HEAD + 2 else HEAD]));
+    try writeAll(fd, std.mem.sliceAsBytes(x.tokens));
+    try writeAll(fd, std.mem.sliceAsBytes(x.starts));
 }
+
+/// The prompt's keyOf and checkOf at each hashed state's token count (one streaming pass; empty when nothing asks).
+const Prefixes = struct {
+    lens: std.ArrayList(u32) = .empty,
+    keys: []u64 = &.{},
+    checks: []u64 = &.{},
+
+    fn of(m: *const Imprint, prompt: []const u32, longer_than: u32) Prefixes {
+        var p: Prefixes = .{};
+        for (m.metas.items) |x| if (x.hashed() and x.at > longer_than and x.n <= prompt.len and x.at < prompt.len and std.mem.indexOfScalar(u32, p.lens.items, x.n) == null) {
+            p.lens.append(m.gpa, x.n) catch return p;
+        };
+        if (p.lens.items.len == 0) return p;
+        std.mem.sort(u32, p.lens.items, {}, std.sort.asc(u32));
+        p.keys = m.gpa.alloc(u64, p.lens.items.len) catch return p;
+        p.checks = m.gpa.alloc(u64, p.lens.items.len) catch return p;
+        var hk = std.hash.Wyhash.init(0x1e47);
+        var hc = std.hash.Wyhash.init(CHECK_SEED);
+        var done: usize = 0;
+        for (p.lens.items, p.keys, p.checks) |n, *k, *c| {
+            const bytes = std.mem.sliceAsBytes(prompt[done..n]);
+            hk.update(bytes);
+            hc.update(bytes);
+            done = n;
+            var fk = hk;
+            var fc = hc;
+            k.* = fk.final();
+            c.* = fc.final();
+        }
+        return p;
+    }
+
+    fn match(p: *const Prefixes, n: u32, key: u64, check: u64) bool {
+        if (p.checks.len != p.lens.items.len) return false; // an allocation failed: no hashed state matches
+        const i = std.mem.indexOfScalar(u32, p.lens.items, n) orelse return false;
+        return p.keys[i] == key and p.checks[i] == check;
+    }
+
+    fn deinit(p: *Prefixes, gpa: Allocator) void {
+        p.lens.deinit(gpa);
+        gpa.free(p.keys);
+        gpa.free(p.checks);
+    }
+};
 
 fn word64(w: []const u32) u64 {
     return @as(u64, w[0]) | @as(u64, w[1]) << 32;

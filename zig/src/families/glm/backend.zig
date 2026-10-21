@@ -121,7 +121,7 @@ pub const Backend = struct {
     }
 
     /// --learn: a kept state to its file here and, on a pair, rank 1's half there; an error unless both are written.
-    pub fn snapWrite(ptr: *anyopaque, saved: *anyopaque, dir: [:0]const u8, key: u64) anyerror!void {
+    pub fn snapWrite(ptr: *anyopaque, saved: *anyopaque, dir: [:0]const u8, key: u64, _: []const u32) anyerror!void {
         const b = self(ptr);
         const snap: *snapshot.Snap = @ptrCast(@alignCast(saved));
         var buf: [1100]u8 = undefined;
@@ -133,7 +133,7 @@ pub const Backend = struct {
     }
 
     /// --learn: learned state `key` read back here and, on a pair, rank 1's half there; an error unless both are.
-    pub fn snapRead(ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32) anyerror!*anyopaque {
+    pub fn snapRead(ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32, _: []const u32) anyerror!*anyopaque {
         const b = self(ptr);
         var buf: [1100]u8 = undefined;
         const file = try snapshot.path(&buf, dir, key, 0);

@@ -27,13 +27,20 @@ pub const Snapshots = struct {
         trim: ?*const fn (ptr: *anyopaque, room: u64) void = null,
         /// Whether a save at `at` would take spare storage (no new storage).
         reuses: ?*const fn (ptr: *anyopaque, at: u32) bool = null,
-        /// Write `saved` as learned state `key`, in files of the family's own under `dir` (null: nothing kept on disk).
-        write: ?*const fn (ptr: *anyopaque, saved: Saved, dir: [:0]const u8, key: u64) anyerror!void = null,
-        /// Learned state `key` of `at` tokens, read back from its files under `dir` into new storage.
-        read: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32) anyerror!Saved = null,
+        /// Write `saved` (its `tokens`) as learned state `key`, files of its own under `dir` (spill: known ones too).
+        write: ?*const fn (ptr: *anyopaque, saved: Saved, dir: [:0]const u8, key: u64, tokens: []const u32) anyerror!void = null,
+        /// Learned state `key` of `at` tokens (`tokens`), read back from its files under `dir` into new storage.
+        read: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32, tokens: []const u32) anyerror!Saved = null,
         /// Learned state `key`'s files under `dir` removed (the cap needs room, or they no longer read back).
         forget: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64) void = null,
+        /// The disk bytes a learned state at `at` takes at most, for the cap (null: `bytes`).
+        disk_bytes: ?*const fn (ptr: *anyopaque, at: u32) u64 = null,
+        /// The states the index holds when the store opens on `dir`: the family drops files of any other (null: none).
+        known: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, keys: []const u64) Known = null,
     };
+
+    /// What `known` found: the index stands, none of it reads back any more (a peer's files changed), or no disk tier.
+    pub const Known = enum { keep, clear, off };
 };
 
 /// What a family's states depend on beyond their position.
@@ -80,6 +87,8 @@ pub const Store = struct {
     counts: Counts = .{},
     shared_keys: std.ArrayList(u64) = .empty, // the tokens of recently planned shared cuts, hashed (at most SHARED_KEYS)
     imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
+    spill: bool = false, // every kept state to the imprint, hashed: an evicted or restarted conversation resumes there
+    min_spill: u32 = 0, // spill: a conversation's state shorter than this stays in memory (shared cuts go at any length)
 
     const SHARED_KEYS = 64;
 
@@ -302,7 +311,7 @@ pub const Store = struct {
         };
         s.held += charged;
         s.counts.kept += 1;
-        if (shared) s.learn(e, starts);
+        if (shared or s.spill) s.learn(e, starts);
         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
         return true;
     }
@@ -311,12 +320,38 @@ pub const Store = struct {
     fn learn(s: *Store, e: *const Entry, starts: []const u32) void {
         const im = s.imprint orelse return;
         const write = s.family.vtable.write orelse return;
+        if (s.spill and !e.shared and e.at < s.min_spill) return;
         const key = imprint.Imprint.keyOf(e.tokens);
-        if (im.has(key) or e.bytes > im.cap) return;
-        while (!im.fits(e.bytes)) s.unlearn(im, im.victim() orelse return); // the least recently used go first
-        write(s.family.ptr, e.saved, im.dir, key) catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
-        im.add(key, e.at, e.tokens, starts, e.bytes) catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
+        const bytes = if (s.family.vtable.disk_bytes) |f| f(s.family.ptr, e.at) else e.bytes;
+        const known = im.has(key);
+        if ((known and !s.spill) or bytes > im.cap) return;
+        if (!known) while (!im.fits(bytes)) s.unlearn(im, im.victim() orelse return); // the least recently used go first
+        write(s.family.ptr, e.saved, im.dir, key, e.tokens) catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
+        if (known) return im.touch(key); // already on disk: the family noted it for this kept state
+        const added = if (s.spill) im.addHashed(key, e.at, e.tokens, starts, bytes) else im.add(key, e.at, e.tokens, starts, bytes);
+        added catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
         if (!@import("builtin").is_test) std.log.info("prompt cache: learned {d} tokens to disk", .{e.at});
+    }
+
+    /// The imprint just opened: kept as its files are, cleared (a peer's files changed), or dropped (false: free it).
+    pub fn adopt(s: *Store) !bool {
+        const im = s.imprint orelse return false;
+        const known = s.family.vtable.known orelse return true;
+        const keys = try s.gpa.alloc(u64, im.metas.items.len);
+        defer s.gpa.free(keys);
+        for (im.metas.items, keys) |x, *k| k.* = x.key;
+        switch (known(s.family.ptr, im.dir, keys)) {
+            .keep => return true,
+            .clear => {
+                for (keys) |k| s.unlearn(im, k);
+                note("the learned states no longer read back; {d} forgotten", .{keys.len});
+                return true;
+            },
+            .off => {
+                s.imprint = null;
+                return false;
+            },
+        }
     }
 
     /// Learned state `key` forgotten: its files (the family's), then its index record.
@@ -330,6 +365,8 @@ pub const Store = struct {
         const im = s.imprint orelse return have;
         const read = s.family.vtable.read orelse return have;
         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
+        const read_ = m.read(); // a hashed state's tokens are the prompt's (best matched them)
+        const tokens = if (m.hashed()) prompt[0..read_] else m.tokens;
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
         while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
             s.remove(s.victimBut(have, prompt) orelse return have);
@@ -337,11 +374,11 @@ pub const Store = struct {
         }
         if (bytes > s.budget) return have;
         const e = s.gpa.create(Entry) catch return have;
-        e.* = .{ .tokens = &.{}, .at = m.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .shared = true };
-        e.tokens = s.gpa.dupe(u32, m.tokens) catch return s.drop(e, have, false);
+        e.* = .{ .tokens = &.{}, .at = m.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .shared = !m.hashed() }; // a spilled turn may be superseded
+        e.tokens = s.gpa.dupe(u32, tokens) catch return s.drop(e, have, false);
         e.last = s.gpa.dupe(u32, prompt) catch return s.drop(e, have, false);
         const key = m.key;
-        e.saved = read(s.family.ptr, im.dir, key, m.at) catch |err| {
+        e.saved = read(s.family.ptr, im.dir, key, m.at, e.tokens) catch |err| {
             note("reading the learned {d} tokens failed ({s}); forgotten, a later pass learns them again", .{ e.at, @errorName(err) });
             s.unlearn(im, key);
             return s.drop(e, have, false);
@@ -411,4 +448,5 @@ fn floorStart(starts: []const u32, at: u32) u32 {
 
 test {
     _ = @import("prompt_cache_test.zig");
+    _ = @import("prompt_spill_test.zig");
 }

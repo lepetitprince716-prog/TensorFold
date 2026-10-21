@@ -23,7 +23,7 @@ const Peer = struct {
 };
 
 /// A family over host memory for tests: its live state is a position and a running sum of the prompt's tokens.
-const Fake = struct {
+pub const Fake = struct {
     gpa: Allocator,
     at: u32 = 0,
     sum: u64 = 0,
@@ -39,24 +39,24 @@ const Fake = struct {
         return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn } };
     }
     /// With learned states on disk: a state's position and sum in one file.
-    fn learned(f: *Fake) Snapshots {
+    pub fn learned(f: *Fake) Snapshots {
         return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .write = writeFn, .read = readFn, .forget = forgetFn } };
     }
     fn forgetFn(_: *anyopaque, dir: [:0]const u8, key: u64) void {
         var path: [512]u8 = undefined;
         _ = std.c.unlink(file(&path, dir, key) catch return);
     }
-    fn file(buf: []u8, dir: []const u8, key: u64) ![:0]const u8 {
+    pub fn file(buf: []u8, dir: []const u8, key: u64) ![:0]const u8 {
         return std.fmt.bufPrintSentinel(buf, "{s}/{x:0>16}.bin", .{ dir, key }, 0);
     }
-    fn writeFn(_: *anyopaque, saved: Saved, dir: [:0]const u8, key: u64) anyerror!void {
+    fn writeFn(_: *anyopaque, saved: Saved, dir: [:0]const u8, key: u64, _: []const u32) anyerror!void {
         var path: [512]u8 = undefined;
         const fd = std.c.open(try file(&path, dir, key), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
         if (fd < 0) return error.WriteFailed;
         defer _ = std.c.close(fd);
         try imprint.writeAll(fd, std.mem.asBytes(@as(*State, @ptrCast(@alignCast(saved)))));
     }
-    fn readFn(ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32) anyerror!Saved {
+    fn readFn(ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32, _: []const u32) anyerror!Saved {
         const f = of(ptr);
         var path: [512]u8 = undefined;
         const fd = std.c.open(try file(&path, dir, key), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
@@ -133,7 +133,7 @@ const Fake = struct {
     }
 
     /// A prompt pass from `plan.from`, keeping at each mark; returns the sum a fresh pass would give.
-    fn pass(f: *Fake, s: *Store, prompt: []const u32, plan: Plan) u64 {
+    pub fn pass(f: *Fake, s: *Store, prompt: []const u32, plan: Plan) u64 {
         if (plan.from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer };
         if (f.peer) |p| p.in_pass = true;
         defer if (f.peer) |p| {
@@ -152,7 +152,7 @@ const Fake = struct {
     }
 };
 
-fn fresh(prompt: []const u32) u64 {
+pub fn fresh(prompt: []const u32) u64 {
     var sum: u64 = 0;
     for (prompt) |t| sum = sum *% 31 +% t;
     return sum;
