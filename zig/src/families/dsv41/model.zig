@@ -27,6 +27,7 @@ const comm_mod = @import("comm.zig");
 const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
+const spill = @import("spill.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -485,6 +486,45 @@ pub const Model = struct {
                 try m.copySpan(cs.idx_scales[i], from / r, to / r, n, c.index_head_dim / 32);
             }
         }
+    }
+
+    /// The planes copyExtent moves, for the disk tier: every kv-source layer's codes and scales and its index keys'.
+    pub fn spillPlanes(m: *const Model, gpa: std.mem.Allocator) ![]spill.Plane {
+        const c = m.eng.c;
+        const cs = &m.caches;
+        var out: std.ArrayList(spill.Plane) = .empty;
+        errdefer out.deinit(gpa);
+        for (m.eng.w.layers, 0..) |lay, i| {
+            if (lay.comp_wkv == null) continue;
+            const r: u32 = lay.ratio;
+            try out.append(gpa, .{ .addr = cs.comp_codes[i], .ratio = r, .row = @intCast(c.head_dim / 2) });
+            try out.append(gpa, .{ .addr = cs.comp_scales[i], .ratio = r, .row = @intCast(c.head_dim / 16) });
+            if (lay.idx_wk == null) continue;
+            try out.append(gpa, .{ .addr = cs.idx_codes[i], .ratio = r, .row = @intCast(c.index_head_dim / 2) });
+            try out.append(gpa, .{ .addr = cs.idx_scales[i], .ratio = r, .row = @intCast(c.index_head_dim / 32) });
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// The disk tier's copies on the model's stream (pinned staging), and their wait.
+    pub fn spillDev(m: *Model) spill.Dev {
+        const D = struct {
+            fn of(ctx: *anyopaque) *Model {
+                return @ptrCast(@alignCast(ctx));
+            }
+            fn toHost(ctx: *anyopaque, dst: []u8, src: u64) anyerror!void {
+                const x = of(ctx);
+                try x.ctx.d.check(x.ctx.d.api.cuMemcpyDtoHAsync_v2(dst.ptr, src, dst.len, x.stream.handle), "cuMemcpyDtoHAsync");
+            }
+            fn toDevice(ctx: *anyopaque, dst: u64, src: []const u8) anyerror!void {
+                const x = of(ctx);
+                try x.ctx.d.check(x.ctx.d.api.cuMemcpyHtoDAsync_v2(dst, src.ptr, src.len, x.stream.handle), "cuMemcpyHtoDAsync");
+            }
+            fn wait(ctx: *anyopaque) anyerror!void {
+                try of(ctx).stream.synchronize();
+            }
+        };
+        return .{ .ctx = m, .to_host = D.toHost, .to_device = D.toDevice, .wait = D.wait };
     }
 
     fn copySpan(m: *Model, plane: u64, from: usize, to: usize, n: usize, row: usize) !void {

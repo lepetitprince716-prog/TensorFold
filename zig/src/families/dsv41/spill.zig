@@ -394,6 +394,87 @@ pub const Spill = struct {
     }
 };
 
+/// A follower's root/<identity>, stamped as the imprint stamps rank 0's; other identities go, oldest first, past `cap`.
+pub fn prepare(gpa: Allocator, root: []const u8, identity: u64, cap: u64) ![:0]u8 {
+    const dir = try std.fmt.allocPrintSentinel(gpa, "{s}/{x:0>16}", .{ root, identity }, 0);
+    errdefer gpa.free(dir);
+    for (dir[1..], 1..) |ch, i| if (ch == '/') {
+        dir[i] = 0;
+        _ = std.c.mkdir(dir.ptr, 0o700);
+        dir[i] = '/';
+    };
+    _ = std.c.mkdir(dir.ptr, 0o700);
+    var buf: [1200]u8 = undefined;
+    const clock = try std.fmt.bufPrintSentinel(&buf, "{s}/clock", .{root}, 0);
+    const now = readWord(clock) + 1;
+    writeWord(clock, now);
+    writeWord(try std.fmt.bufPrintSentinel(&buf, "{s}/used", .{dir}, 0), now);
+    const Other = struct { name: [16]u8, bytes: u64, used: u64 };
+    var others: std.ArrayList(Other) = .empty;
+    defer others.deinit(gpa);
+    var held = dirBytes(dir, false);
+    const d = std.c.opendir(try std.fmt.bufPrintSentinel(&buf, "{s}", .{root}, 0)) orelse return dir;
+    while (std.c.readdir(d)) |ent| {
+        const name = std.mem.sliceTo(&ent.name, 0);
+        if (name.len != 16 or std.mem.endsWith(u8, dir, name)) continue;
+        _ = std.fmt.parseInt(u64, name, 16) catch continue;
+        var sub: [1200]u8 = undefined;
+        const path = try std.fmt.bufPrintSentinel(&sub, "{s}/{s}", .{ root, name }, 0);
+        var ub: [1300]u8 = undefined;
+        const x: Other = .{ .name = name[0..16].*, .bytes = dirBytes(path, false), .used = readWord(try std.fmt.bufPrintSentinel(&ub, "{s}/used", .{path}, 0)) };
+        held += x.bytes;
+        try others.append(gpa, x);
+    }
+    _ = std.c.closedir(d);
+    std.mem.sort(Other, others.items, {}, struct {
+        fn older(_: void, a: Other, b: Other) bool {
+            return a.used < b.used;
+        }
+    }.older);
+    for (others.items) |x| {
+        if (held <= cap) break;
+        var sub: [1200]u8 = undefined;
+        const path = try std.fmt.bufPrintSentinel(&sub, "{s}/{s}", .{ root, &x.name }, 0);
+        _ = dirBytes(path, true);
+        if (std.c.rmdir(path) == 0) held -|= x.bytes;
+    }
+    return dir;
+}
+
+/// The bytes of the regular files directly in `dir`, each unlinked when `remove`.
+fn dirBytes(dir: [:0]const u8, remove: bool) u64 {
+    const d = std.c.opendir(dir) orelse return 0;
+    defer _ = std.c.closedir(d);
+    var n: u64 = 0;
+    while (std.c.readdir(d)) |ent| {
+        if (ent.type != std.c.DT.REG) continue;
+        var p: [1400]u8 = undefined;
+        const f = std.fmt.bufPrintSentinel(&p, "{s}/{s}", .{ dir, std.mem.sliceTo(&ent.name, 0) }, 0) catch continue;
+        const fd = std.c.open(f, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) continue;
+        const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+        _ = std.c.close(fd);
+        if (end > 0) n += @intCast(end);
+        if (remove) _ = std.c.unlink(f);
+    }
+    return n;
+}
+
+fn readWord(path: [:0]const u8) u64 {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return 0;
+    defer _ = std.c.close(fd);
+    var w: u64 = 0;
+    return if (readAt(fd, std.mem.asBytes(&w), 0)) w else 0;
+}
+
+fn writeWord(path: [:0]const u8, w: u64) void {
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    pwriteAll(fd, std.mem.asBytes(&w), 0) catch {};
+}
+
 fn pwriteAll(fd: std.c.fd_t, bytes: []const u8, at: usize) !void {
     var done: usize = 0;
     while (done < bytes.len) {

@@ -274,3 +274,27 @@ test "an identity follows a file's bytes, or its sample, and the names in a dire
     put(try std.fmt.bufPrintSentinel(&p, "{s}/b.cubin", .{dir}, 0), "x");
     try std.testing.expect(s1 != try of(gpa, dir, false));
 }
+
+test "a follower's directory is made and stamped; other identities go oldest first past the cap" {
+    const gpa = std.testing.allocator;
+    var rbuf: [128]u8 = undefined;
+    const root = try scratch(&rbuf, "prep");
+    const old = try spill.prepare(gpa, root, 1, 1 << 30);
+    defer gpa.free(old);
+    var p: [512]u8 = undefined;
+    const fd = std.c.open(try std.fmt.bufPrintSentinel(&p, "{s}/x.blk", .{old}, 0), .{ .ACCMODE = .WRONLY, .CREAT = true }, @as(std.c.mode_t, 0o600));
+    _ = std.c.write(fd, "0123456789", 10);
+    _ = std.c.close(fd);
+    const mid = try spill.prepare(gpa, root, 2, 1 << 30);
+    defer gpa.free(mid);
+    const now = try spill.prepare(gpa, root, 3, 16 + 8); // room for the stamps, not for identity 1's 10 bytes
+    defer gpa.free(now);
+    var b: [128]u8 = undefined;
+    try std.testing.expect(std.c.opendir(try std.fmt.bufPrintSentinel(&b, "{s}", .{old}, 0)) == null);
+    const keep = std.c.opendir(try std.fmt.bufPrintSentinel(&b, "{s}", .{mid}, 0));
+    try std.testing.expect(keep != null);
+    _ = std.c.closedir(keep.?);
+    for ([_][]const u8{ mid, now }) |d| rmDir(d);
+    _ = std.c.unlink(try std.fmt.bufPrintSentinel(&p, "{s}/clock", .{root}, 0));
+    rmDir(root);
+}

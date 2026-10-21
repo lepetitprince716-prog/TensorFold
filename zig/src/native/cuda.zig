@@ -157,6 +157,7 @@ const Host = struct {
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
+    learned: ?api.prompt_imprint.Imprint = null, // spill mode: the kept states' index on disk
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -166,6 +167,7 @@ const Host = struct {
         if (h.gpu) |g| g.ctx.makeCurrent() catch {};
         if (h.cache) |*store| store.deinit(); // the family's kept states go before the family
         h.release(h.family);
+        if (h.learned) |*m| m.deinit();
         if (h.gpu) |g| {
             g.ctx.deinit();
             g.driver.close();
@@ -395,6 +397,13 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         if (want > 0) {
             h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
             h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{ .tail = if (@hasField(@TypeOf(sn), "tail")) sn.tail else 0 }, want);
+            if (@hasField(@TypeOf(sn), "spill")) if (sn.spill) |sp| spillTo(h, gpa, sp) catch |e| {
+                std.log.err("prompt cache: kept states stay in memory, the disk tier did not open ({s})", .{@errorName(e)});
+                h.cache.?.imprint = null;
+                h.cache.?.spill = false;
+                if (h.learned) |*m| m.deinit();
+                h.learned = null;
+            };
         }
     };
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
@@ -402,6 +411,27 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+}
+
+/// Spill mode: every kept state also under the imprint at the family's tier root, checked against its files first.
+fn spillTo(h: *Host, gpa: Allocator, sp: anytype) !void {
+    const store = &h.cache.?;
+    h.snap_vt.write = sp.write;
+    h.snap_vt.read = sp.read;
+    h.snap_vt.forget = sp.forget;
+    h.snap_vt.disk_bytes = sp.disk_bytes;
+    h.snap_vt.known = sp.known;
+    h.learned = try api.prompt_imprint.Imprint.open(gpa, sp.root, sp.identity, sp.cap);
+    store.imprint = &h.learned.?;
+    store.spill = true;
+    store.min_spill = sp.min_tokens;
+    if (!try store.adopt()) {
+        h.learned.?.deinit();
+        h.learned = null;
+        return;
+    }
+    const m = &h.learned.?;
+    std.log.info("prompt cache: kept states spill to {s} ({d} known, {d} of {d} GiB)", .{ m.dir, m.metas.items.len, m.total() >> 30, sp.cap >> 30 });
 }
 
 /// A family's reasoning efforts as numbers its chat template takes (F.efforts: name and value), else none.

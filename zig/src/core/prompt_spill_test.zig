@@ -106,8 +106,8 @@ test "below min_spill a conversation's state stays in memory only; a shared cut 
 }
 
 var answer: pc.Snapshots.Known = .keep;
-fn knownFn(_: *anyopaque, _: [:0]const u8, _: []const u64) pc.Snapshots.Known {
-    return answer;
+fn knownFn(_: *anyopaque, _: [:0]const u8, _: []const u64) u8 {
+    return @intFromEnum(answer);
 }
 
 test "adopt: a family that cannot read the index back clears it, one without a disk tier drops the imprint" {

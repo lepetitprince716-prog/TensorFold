@@ -33,6 +33,7 @@ const round = @import("round.zig");
 const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
 const vision_mod = @import("vision.zig");
+const spill_lanes = @import("spill_lanes.zig");
 
 pub const model_type = "deepseek_v41";
 pub const formats: []const []const u8 = &.{"exl3-mul1"};
@@ -73,6 +74,20 @@ pub const Snaps = struct {
     drop: *const fn (*anyopaque, *anyopaque) void,
     /// Rows a resumed prompt pass must still run past a kept state (core/prompt_cache Rules.tail).
     tail: u32 = 0,
+    /// Spill mode (TF_DS_SPILL_DIR): the disk tier's functions, its root, cap, shortest state and this rank's identity.
+    spill: ?Spill = null,
+};
+
+pub const Spill = struct {
+    write: *const fn (*anyopaque, *anyopaque, [:0]const u8, u64, []const u32) anyerror!void,
+    read: *const fn (*anyopaque, [:0]const u8, u64, u32, []const u32) anyerror!*anyopaque,
+    forget: *const fn (*anyopaque, [:0]const u8, u64) void,
+    disk_bytes: *const fn (*anyopaque, u32) u64,
+    known: *const fn (*anyopaque, [:0]const u8, []const u64) u8,
+    root: []const u8,
+    cap: u64,
+    min_tokens: u32,
+    identity: u64,
 };
 
 /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
@@ -81,6 +96,7 @@ const State = struct {
     m: *model.Model,
     lanes: lanes_mod.Lanes,
     vision: ?*vision_mod.Vision = null,
+    tier: ?*spill_lanes.Tier = null,
 };
 
 fn getenv(name: [:0]const u8) ?[]const u8 {
@@ -118,7 +134,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const st = try gpa.create(State);
     errdefer gpa.destroy(st);
     st.gpa = gpa;
-    st.m = try model.Model.open(gpa, io, ctx, .{
+    const spill_settings = try spill_lanes.Settings.read();
+    const opts: model.Options = .{
         .model_dir = dir,
         .cache_dir = getenv("TF_DS_RANK_CACHE") orelse return error.NoRankCache,
         .kit_dir = getenv("TF_DS_KIT") orelse return error.NoKit,
@@ -141,7 +158,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
         .round_ms = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs else null,
         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
-    });
+    };
+    st.m = try model.Model.open(gpa, io, ctx, opts);
     errdefer st.m.close();
     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
@@ -150,15 +168,23 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (st.m.cfg.vision) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);
     errdefer if (st.vision) |v| v.close();
     st.lanes.vision = st.vision;
+    st.tier = null;
+    if (spill_settings) |ss| {
+        st.tier = try spill_lanes.Tier.open(gpa, st.m, ss, try spill_lanes.identity(gpa, st.m, opts));
+        st.lanes.spill = st.tier;
+    }
+    errdefer if (st.tier) |t| t.close(gpa);
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
-    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
+    var snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
+    if (st.tier) |t| snaps.spill = .{ .write = spill_lanes.writeFn, .read = spill_lanes.readFn, .forget = spill_lanes.forgetFn, .disk_bytes = spill_lanes.diskBytesFn, .known = spill_lanes.knownFn, .root = t.settings.root, .cap = t.settings.cap, .min_tokens = t.settings.min_tokens, .identity = t.identity };
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
 }
 
 fn deinitFn(ptr: *anyopaque) void {
     const st: *State = @ptrCast(@alignCast(ptr));
     st.lanes.deinit(); // rank 1 hears done
+    if (st.tier) |t| t.close(st.gpa);
     if (st.vision) |v| v.close();
     st.m.close();
     st.gpa.destroy(st);
@@ -177,6 +203,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
+        error.BadSpillGib, error.BadSpillMin, error.BadSpillStaging => "TF_DS_SPILL_GIB, TF_DS_SPILL_MIN_TOKENS and TF_DS_SPILL_STAGING_MIB take numbers",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
         else => null,
     };

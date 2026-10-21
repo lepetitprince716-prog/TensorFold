@@ -35,12 +35,12 @@ pub const Snapshots = struct {
         forget: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64) void = null,
         /// The disk bytes a learned state at `at` takes at most, for the cap (null: `bytes`).
         disk_bytes: ?*const fn (ptr: *anyopaque, at: u32) u64 = null,
-        /// The states the index holds when the store opens on `dir`: the family drops files of any other (null: none).
-        known: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, keys: []const u64) Known = null,
+        /// The states the index holds when the store opens on `dir`: the family drops any other's files, says a Known.
+        known: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, keys: []const u64) u8 = null,
     };
 
     /// What `known` found: the index stands, none of it reads back any more (a peer's files changed), or no disk tier.
-    pub const Known = enum { keep, clear, off };
+    pub const Known = enum(u8) { keep = 0, clear = 1, off = 2 };
 };
 
 /// What a family's states depend on beyond their position.
@@ -340,18 +340,15 @@ pub const Store = struct {
         const keys = try s.gpa.alloc(u64, im.metas.items.len);
         defer s.gpa.free(keys);
         for (im.metas.items, keys) |x, *k| k.* = x.key;
-        switch (known(s.family.ptr, im.dir, keys)) {
-            .keep => return true,
-            .clear => {
-                for (keys) |k| s.unlearn(im, k);
-                note("the learned states no longer read back; {d} forgotten", .{keys.len});
-                return true;
-            },
-            .off => {
-                s.imprint = null;
-                return false;
-            },
+        const answer = known(s.family.ptr, im.dir, keys);
+        if (answer == @intFromEnum(Snapshots.Known.keep)) return true;
+        if (answer == @intFromEnum(Snapshots.Known.clear)) {
+            for (keys) |k| s.unlearn(im, k);
+            note("the learned states no longer read back; {d} forgotten", .{keys.len});
+            return true;
         }
+        s.imprint = null; // off
+        return false;
     }
 
     /// Learned state `key` forgotten: its files (the family's), then its index record.

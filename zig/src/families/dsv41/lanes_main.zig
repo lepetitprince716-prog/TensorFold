@@ -159,7 +159,19 @@ pub fn main(init: std.process.Init) !u8 {
             }
             w.flush() catch {};
         };
-        dsv41.lanes.follow(gpa, m) catch |err| {
+        // spill mode (TF_DS_SPILL_DIR, as rank 0's): this rank's half of every kept state on its own disk
+        var tier: ?*dsv41.spill_lanes.Tier = null;
+        defer if (tier) |t| t.close(gpa);
+        if (try dsv41.spill_lanes.Settings.read()) |ss| {
+            const id = try dsv41.spill_lanes.identity(gpa, m, o);
+            const dir = try dsv41.spill.prepare(gpa, ss.root, id, ss.cap);
+            defer gpa.free(dir);
+            tier = try dsv41.spill_lanes.Tier.open(gpa, m, ss, id);
+            try tier.?.sp.open(dir);
+            try w.print("{{\"rank\": {d}, \"spill\": \"{s}\", \"states\": {d}}}\n", .{ o.rank, dir, tier.?.sp.states.count() });
+            try w.flush();
+        }
+        dsv41.lanes.follow(gpa, m, tier) catch |err| {
             try w.print("{{\"rank\": {d}, \"follow\": \"{s}\"}}\n", .{ o.rank, @errorName(err) });
             try w.flush();
             return 1;
