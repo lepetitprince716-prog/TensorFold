@@ -164,6 +164,14 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer st.m.close();
     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+    // TF_DS_SHAPE_LOG=N: the rounds' shape by streams as a log line every N rounds (1: 256); no Model.prof, so no syncs
+    if (nonEmpty(getenv("TF_DS_SHAPE_LOG"))) |t| {
+        const every = std.fmt.parseInt(u64, t, 10) catch return error.BadShapeLog;
+        if (every > 0) {
+            st.lanes.prof = .{};
+            st.lanes.shape_every = if (every == 1) 256 else every;
+        }
+    }
     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
     st.vision = null;
     if (st.m.cfg.vision) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);
@@ -212,6 +220,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.SamplingNotSupported => sampling_words,
         error.BadWatchdog => "TF_DS_WATCHDOG_S takes whole seconds (default 120; 0 turns the watchdog off)",
         error.BadWatchdogStart => "TF_DS_WATCHDOG_START_S takes whole seconds (default 600; 0 leaves the start-up exchange unwatched)",
+        error.BadShapeLog => "TF_DS_SHAPE_LOG takes a number of rounds between log lines (0 is off, 1 is 256)",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
         else => null,
     };
@@ -223,5 +232,6 @@ test "refusals name what to set" {
     try std.testing.expectEqualStrings("top_k must be 1-56 when sampling", explain(null, error.SamplingNotSupported).?);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadWatchdog).?, "TF_DS_WATCHDOG_S") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadWatchdogStart).?, "TF_DS_WATCHDOG_START_S") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadShapeLog).?, "TF_DS_SHAPE_LOG") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }

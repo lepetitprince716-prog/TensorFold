@@ -319,6 +319,24 @@ fn unsupported(s: ?lanes.Sampling) bool {
     return sm.temperature > 0 and (sm.top_k == 0 or sm.top_k > sampling.max_top_k);
 }
 
+/// One stream count's sums (Profile.by): the rounds over that many windows, the drafter passes over that many streams.
+pub const Shape = struct {
+    rounds: u64 = 0,
+    rows: u64 = 0,
+    sampled: u64 = 0, // the rounds with a sampled row
+    wall: u64 = 0, // ns, a round's start to the next round's (Pace), summed over `timed` rounds
+    timed: u64 = 0,
+    logits: u64 = 0, // ns waiting for the round's greedy tokens, candidates or logits
+    sample: u64 = 0, // ns drawing the rows' tokens
+    passes: u64 = 0,
+    pass: u64 = 0, // ns
+};
+
+/// A mean in ms: `ns` over `n` (0 when nothing was counted).
+fn meanMs(ns: u64, n: u64) f64 {
+    return if (n == 0) 0 else @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n)) / 1e6;
+}
+
 /// Where rank 0's backend calls spend their time (ns, summed; --profile): a round's frame to rank 1, its forward
 /// and absorb (synchronized apart), the logits' copy to the host and the draws; the drafter passes; the prefills.
 pub const Profile = struct {
@@ -335,6 +353,66 @@ pub const Profile = struct {
     passes: u64 = 0,
     pass_streams: u64 = 0,
     prefills: u64 = 0,
+    by: [max_streams + 1]Shape = @splat(.{}), // by the streams of a round or a pass (TF_DS_SHAPE_LOG; index 0 unused)
+
+    /// A round over `streams` windows and `rows` rows has drawn: its wait for tokens, candidates or logits, its draws.
+    pub fn roundOf(p: *Profile, streams: usize, rows: usize, logits: u64, sample: u64, sampled: bool) void {
+        const s = &p.by[@min(streams, max_streams)];
+        s.rounds += 1;
+        s.rows += rows;
+        s.logits += logits;
+        s.sample += sample;
+        s.sampled += @intFromBool(sampled);
+    }
+
+    /// A round over `streams` windows ran `ns` from its start to the next round's.
+    pub fn wallOf(p: *Profile, streams: usize, ns: u64) void {
+        const s = &p.by[@min(streams, max_streams)];
+        s.wall += ns;
+        s.timed += 1;
+    }
+
+    /// A drafter pass over `streams` streams took `ns`.
+    pub fn passOf(p: *Profile, streams: usize, ns: u64) void {
+        const s = &p.by[@min(streams, max_streams)];
+        s.passes += 1;
+        s.pass += ns;
+    }
+
+    /// The sums as the log line's JSON: per stream count seen, counts summed and times as ms a round (ms_pass: a pass).
+    pub fn shapeLine(p: *const Profile, buf: []u8) []const u8 {
+        var at: usize = 0;
+        const head = std.fmt.bufPrint(buf, "{{\"rounds\": {d}, \"by_streams\": {{", .{p.rounds}) catch return "";
+        at += head.len;
+        var first = true;
+        for (p.by[1..], 1..) |s, k| {
+            if (s.rounds == 0 and s.passes == 0) continue;
+            const sep = if (first) "" else ", ";
+            first = false;
+            const got = std.fmt.bufPrint(buf[at..], "{s}\"{d}\": {{\"rounds\": {d}, \"rows\": {d}, \"ms_round\": {d:.3}, \"ms_wait\": {d:.3}, \"ms_draw\": {d:.3}, \"ms_pass\": {d:.3}, \"sampled\": {d}}}", .{ sep, k, s.rounds, s.rows, meanMs(s.wall, s.timed), meanMs(s.logits, s.rounds), meanMs(s.sample, s.rounds), meanMs(s.pass, s.passes), s.sampled }) catch break;
+            at += got.len;
+        }
+        const tail = std.fmt.bufPrint(buf[at..], "}}}}", .{}) catch return buf[0..at];
+        return buf[0 .. at + tail.len];
+    }
+};
+
+/// A round's wall time: its start to the next round's, unless another primitive began between them or `cap` apart.
+const Pace = struct {
+    at: u64 = 0, // the last round's start (the monotonic clock, ns; 0: none yet)
+    streams: usize = 0, // its windows
+    other: bool = false, // a primitive other than a round or a drafter pass began since
+
+    const cap: u64 = 2 * std.time.ns_per_s;
+    const Gap = struct { streams: usize, ns: u64 };
+
+    /// A round of `streams` windows starts at `at`: the round before it with its wall time, when that counts.
+    fn start(pc: *Pace, at: u64, streams: usize) ?Gap {
+        const was = pc.*;
+        pc.* = .{ .at = at, .streams = streams };
+        if (was.at == 0 or was.other or at <= was.at or at - was.at > cap) return null;
+        return .{ .streams = was.streams, .ns = at - was.at };
+    }
 };
 
 /// A round-cost table "30.0,35.2,..." (TF_DS_ROUND_MS's form): ms by rows from 1.
@@ -408,6 +486,8 @@ pub const Lanes = struct {
     seqs: [max_streams]std.ArrayList(i32) = @splat(.empty),
     built: Built = .{},
     prof: ?Profile = null,
+    shape_every: u64 = 0, // TF_DS_SHAPE_LOG: the profile's sums as one log line every this many rounds (0: none)
+    pace: Pace = .{}, // the round to round wall time that line shows
     fix_k: ?usize = null, // a measurement (tf-dsv41-lanes --fix-k): K drafts a stream, chances 1 to K and 0 past it
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
@@ -519,6 +599,7 @@ pub const Lanes = struct {
     }
 
     pub fn begin(self: *Lanes, kind: Kind) !bool {
+        if (kind != .verify and kind != .pass) self.pace.other = true;
         if (self.peer == null) return false;
         try self.wire.begin(self.gpa, kind, self.step);
         self.step += 1;
@@ -544,6 +625,14 @@ pub const Lanes = struct {
 
     pub fn idle(self: *Lanes) void {
         if (self.dog) |d| d.idle();
+    }
+
+    /// TF_DS_SHAPE_LOG: the profile's sums as one log line; the sums then start over.
+    fn shapeSay(self: *Lanes) void {
+        const p = if (self.prof) |*x| x else return;
+        var buf: [4096]u8 = undefined;
+        std.log.info("round shape: {s}", .{p.shapeLine(&buf)});
+        p.* = .{};
     }
 
     // -- the vtable ---------------------------------------------------------------------------------------------
@@ -808,6 +897,7 @@ pub const Lanes = struct {
             wins[k] = .{ .slot = l.slot, .base = l.base, .end = l.end, .start = start, .absorb = m.drafting() and w.stream.drafts, .ids = ids[k][0..rows] };
         }
         const t0 = m.now();
+        if (self.prof) |*p| if (self.pace.start(t0, windows.len)) |gap| p.wallOf(gap.streams, gap.ns);
         if (try self.begin(.verify)) {
             try self.wire.int(gpa, u32, @intCast(windows.len));
             for (wins[0..windows.len]) |w| {
@@ -836,14 +926,17 @@ pub const Lanes = struct {
         const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
         const t3 = m.now();
         defer if (self.prof) |*p| {
+            const drew = m.now() - t3;
             p.send += t1 - t0;
             p.enqueue += m.t_enqueue;
             p.forward += m.t_forward;
             p.absorb += m.t_absorb;
             p.logits += t3 - t2;
-            p.sample += m.now() - t3;
+            p.sample += drew;
             p.rounds += 1;
             p.rows += rows.ids.len;
+            p.roundOf(windows.len, rows.ids.len, t3 - t2, drew, !greedy);
+            if (self.shape_every > 0 and p.rounds >= self.shape_every) self.shapeSay();
         };
         const V = m.vocab;
         for (windows, out, 0..) |w, *o, k| {
@@ -916,9 +1009,11 @@ pub const Lanes = struct {
         const t0 = m.now();
         try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps);
         if (self.prof) |*p| {
-            p.pass += m.now() - t0;
+            const took = m.now() - t0;
+            p.pass += took;
             p.passes += 1;
             p.pass_streams += n;
+            p.passOf(n, took);
         }
         const d = &m.dr.?;
         for (asked[0..n], depths[0..n], 0..) |l, k, i| {
@@ -1644,4 +1739,80 @@ test "a sampling the sampler cannot draw is refused before a frame is built" {
     try std.testing.expect(!unsupported(.{ .seed = 1, .temperature = 0.7, .top_k = sampling.max_top_k }));
     try std.testing.expect(unsupported(.{ .seed = 1, .temperature = 0.7, .top_k = 0 }));
     try std.testing.expect(unsupported(.{ .seed = 1, .temperature = 0.7, .top_k = sampling.max_top_k + 1 }));
+}
+
+test "round shape sums by the streams of a round and of a pass, and prints as one JSON line" {
+    var p: Profile = .{};
+    p.roundOf(4, 15, 50_000_000, 400_000, true);
+    p.roundOf(4, 16, 52_000_000, 600_000, true);
+    p.roundOf(1, 3, 20_000_000, 100_000, false);
+    p.rounds = 3; // (verifyRound counts the total)
+    for ([_]u64{ 80_000_000, 82_000_000, 81_000_000 }) |ns| p.wallOf(4, ns);
+    p.wallOf(1, 30_000_000);
+    p.passOf(4, 6_000_000);
+    p.passOf(4, 7_000_000);
+    p.passOf(2, 5_000_000); // a pass over two streams after a round of three: it is the two-stream pass's
+    var buf: [2048]u8 = undefined;
+    const want =
+        \\{"rounds": 3, "by_streams": {"1": {"rounds": 1, "rows": 3, "ms_round": 30.000, "ms_wait": 20.000, "ms_draw": 0.100, "ms_pass": 0.000, "sampled": 0}, "2": {"rounds": 0, "rows": 0, "ms_round": 0.000, "ms_wait": 0.000, "ms_draw": 0.000, "ms_pass": 5.000, "sampled": 0}, "4": {"rounds": 2, "rows": 31, "ms_round": 81.000, "ms_wait": 51.000, "ms_draw": 0.500, "ms_pass": 6.500, "sampled": 2}}}
+    ;
+    try std.testing.expectEqualStrings(want, p.shapeLine(&buf));
+    // the global sums are untouched by the per-stream ones, and the line of nothing is empty of streams
+    try std.testing.expectEqual(@as(u64, 0), p.rows);
+    const none: Profile = .{};
+    try std.testing.expectEqualStrings("{\"rounds\": 0, \"by_streams\": {}}", none.shapeLine(&buf));
+    // every stream count seen fits the log line's buffer, and a buffer too small gives a cut line, not a crash
+    var full: Profile = .{};
+    for (1..max_streams + 1) |k| {
+        full.roundOf(k, 1 << 40, 1 << 40, 1 << 40, true);
+        full.wallOf(k, 1 << 40);
+        full.passOf(k, 1 << 40);
+    }
+    var big: [4096]u8 = undefined;
+    const text = full.shapeLine(&big);
+    try std.testing.expect(text.len < big.len and std.mem.endsWith(u8, text, "}}}"));
+    var tiny: [40]u8 = undefined;
+    try std.testing.expect(full.shapeLine(&tiny).len <= tiny.len);
+}
+
+test "a round's wall time is its start to the next round's, unless another primitive or a long gap lies between" {
+    var pc: Pace = .{};
+    try std.testing.expect(pc.start(1000, 4) == null); // nothing before the first
+    const gap = pc.start(81_001_000, 3).?;
+    try std.testing.expectEqual(@as(usize, 4), gap.streams); // (the earlier round's, with its own stream count)
+    try std.testing.expectEqual(@as(u64, 81_000_000), gap.ns);
+    pc.other = true; // a prompt pass began between these two
+    try std.testing.expect(pc.start(500_000_000, 3) == null);
+    try std.testing.expectEqual(@as(u64, 20_000_000), pc.start(520_000_000, 3).?.ns); // (the mark was cleared)
+    try std.testing.expect(pc.start(520_000_000 + Pace.cap + 1, 3) == null); // nothing decoded in between
+    try std.testing.expectEqual(Pace.cap, pc.start(520_000_000 + 2 * Pace.cap + 1, 2).?.ns);
+    try std.testing.expect(pc.start(520_000_000, 2) == null); // a clock that went back counts for nothing
+}
+
+test "only a round and a drafter pass leave the wall time between rounds unspoiled" {
+    var m: Model = undefined;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    for ([_]Kind{ .verify, .pass }) |kind| {
+        try std.testing.expect(!try ln.begin(kind)); // (one rank: no frame)
+        try std.testing.expect(!ln.pace.other);
+    }
+    for ([_]Kind{ .fill_begin, .fill_chunk, .fill_images, .snap_save, .snap_restore, .snap_drop, .spill_sync, .spill_write, .spill_load, .spill_forget, .done }) |kind| {
+        ln.pace.other = false;
+        try std.testing.expect(!try ln.begin(kind));
+        try std.testing.expect(ln.pace.other);
+    }
+}
+
+test "the shape line is said every shape_every rounds and the sums start over" {
+    var m: Model = undefined;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null, .prof = .{}, .shape_every = 2 };
+    const p = &ln.prof.?;
+    p.roundOf(3, 9, 1, 1, false);
+    p.rounds = 2;
+    p.prefills = 5;
+    ln.shapeSay();
+    try std.testing.expectEqual(@as(u64, 0), p.rounds);
+    try std.testing.expectEqual(@as(u64, 0), p.by[3].rounds);
+    try std.testing.expectEqual(@as(u64, 0), p.prefills);
+    try std.testing.expectEqual(@as(u64, 2), ln.shape_every);
 }
