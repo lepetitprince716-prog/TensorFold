@@ -22,6 +22,8 @@ pub const Sampling = struct {
 pub const margin = 8;
 /// The candidates a row takes at most here (top_k + MARGIN).
 pub const max_candidates = 64;
+/// The largest top_k a row is drawn with: its top_k + MARGIN candidates must fit max_candidates.
+pub const max_top_k = max_candidates - margin;
 
 extern "c" fn exp(x: f64) f64;
 extern "c" fn log(x: f64) f64;
@@ -158,6 +160,14 @@ test "numpy's pairwise sum" {
     var want = ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]));
     for (a[8..]) |v| want += v;
     try std.testing.expectEqual(want, pairwiseSum(&a));
+}
+
+test "max_top_k is the largest top_k a row is drawn with, and 0 is the nucleus path the port lacks" {
+    var row: [200]f32 = undefined;
+    for (&row, 0..) |*v, i| v.* = @floatFromInt(i);
+    _ = try sampleRow(&row, 1, .{ .seed = 1, .top_k = max_top_k });
+    try std.testing.expectError(error.TooManyCandidates, sampleRow(&row, 1, .{ .seed = 1, .top_k = max_top_k + 1 }));
+    try std.testing.expectError(error.NotPortedYet, sampleRow(&row, 1, .{ .seed = 1, .top_k = 0 }));
 }
 
 test "top candidates by value, then id" {

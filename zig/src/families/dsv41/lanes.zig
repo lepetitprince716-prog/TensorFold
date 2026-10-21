@@ -236,6 +236,12 @@ pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
     return @intCast(t);
 }
 
+/// Whether the sampler cannot draw this request: above temperature 0 it needs a top_k from 1 to sampling.max_top_k.
+fn unsupported(s: ?lanes.Sampling) bool {
+    const sm = s orelse return false;
+    return sm.temperature > 0 and (sm.top_k == 0 or sm.top_k > sampling.max_top_k);
+}
+
 /// Where rank 0's backend calls spend their time (ns, summed; --profile): a round's frame to rank 1, its forward
 /// and absorb (synchronized apart), the logits' copy to the host and the draws; the drafter passes; the prefills.
 pub const Profile = struct {
@@ -499,6 +505,7 @@ pub const Lanes = struct {
         const ids = s.prompt();
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
+        if (unsupported(s.sampling)) return error.SamplingNotSupported;
         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
         if (size > m.pool_cap) return error.PromptTooLong;
         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
@@ -1208,4 +1215,25 @@ test "a prefix two conversations share: the second one resuming it in place woul
     try ln.snaps.append(std.testing.allocator, &later);
     try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
+}
+
+test "a sampling the sampler cannot draw is refused before a frame is built" {
+    const gpa = std.testing.allocator;
+    var m: Model = undefined;
+    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = .{ .fd = -1 } };
+    defer ln.wire.deinit(gpa);
+    const prompt = [_]u32{ 1, 2, 3 };
+    for ([_]u32{ 0, sampling.max_top_k + 1, std.math.maxInt(u32) }) |k| {
+        var s = try lanes.Stream.init(gpa, .{ .id = "t", .prompt = &prompt, .max_new = 8, .sampling = .{ .seed = 1, .temperature = 0.7, .top_k = k } });
+        defer s.deinit(gpa);
+        try std.testing.expectError(error.SamplingNotSupported, ln.fillOpen(&s));
+        try std.testing.expectEqual(@as(u64, 0), ln.step); // no begin, so no frame
+        try std.testing.expectEqual(@as(usize, 0), ln.wire.buf.items.len);
+    }
+    try std.testing.expect(!unsupported(null));
+    try std.testing.expect(!unsupported(.{ .seed = 1, .temperature = 0, .top_k = 0 })); // greedy reads no top_k
+    try std.testing.expect(!unsupported(.{ .seed = 1, .temperature = 0.7, .top_k = 1 }));
+    try std.testing.expect(!unsupported(.{ .seed = 1, .temperature = 0.7, .top_k = sampling.max_top_k }));
+    try std.testing.expect(unsupported(.{ .seed = 1, .temperature = 0.7, .top_k = 0 }));
+    try std.testing.expect(unsupported(.{ .seed = 1, .temperature = 0.7, .top_k = sampling.max_top_k + 1 }));
 }

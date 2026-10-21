@@ -34,6 +34,7 @@ const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
 const vision_mod = @import("vision.zig");
 const spill_lanes = @import("spill_lanes.zig");
+const sampling = @import("sampling.zig");
 
 pub const model_type = "deepseek_v41";
 pub const formats: []const []const u8 = &.{"exl3-mul1"};
@@ -190,6 +191,9 @@ fn deinitFn(ptr: *anyopaque) void {
     st.gpa.destroy(st);
 }
 
+/// What a sampled request needs: the sampler draws from top_k + its margin candidates, so top_k has a ceiling.
+const sampling_words = std.fmt.comptimePrint("top_k must be 1-{d} when sampling", .{sampling.max_top_k});
+
 /// A request or a start this engine refuses, in words; null: none of its own.
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
@@ -204,6 +208,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.BadSpillGib, error.BadSpillMin, error.BadSpillStaging => "TF_DS_SPILL_GIB, TF_DS_SPILL_MIN_TOKENS and TF_DS_SPILL_STAGING_MIB take numbers",
+        error.SamplingNotSupported => sampling_words,
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
         else => null,
     };
@@ -212,5 +217,6 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
+    try std.testing.expectEqualStrings("top_k must be 1-56 when sampling", explain(null, error.SamplingNotSupported).?);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }
