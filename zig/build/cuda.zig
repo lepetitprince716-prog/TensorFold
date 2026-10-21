@@ -151,6 +151,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_lanes.addImport("cuda", cuda);
     ds_lanes.addImport("lanes", mods.lanes);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-lanes", .root_module = ds_lanes }));
+    // the device's sampling candidates against the host's topCandidates on random logits rows (dsv41_candidates.cuh)
+    const ds_topcand = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/topcand_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_topcand.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+    ds_topcand.addImport("cuda", cuda);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-topcand", .root_module = ds_topcand }));
     _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.core, mods.tokenizer, build_options, true);
 }
 
