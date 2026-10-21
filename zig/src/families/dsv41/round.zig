@@ -187,6 +187,7 @@ pub const Round = struct {
     pf_fork: ?cuda.Event = null,
     pf_join: ?cuda.Event = null,
     pf_out: bool = false,
+    hot: []const Hot = &.{}, // TF_DS_L2_HOT: each layer's small tensors, prefetched unpaced at its forks (useHot)
     timer: ?*PhaseTimer = null, // eager rounds' GPU time by phase (a profile)
     // a profile's GPU clocks a round (Model.useClock): at the forward's start, then before and after each stretch
     // a profile's kernel launches by the phase they end in (eager rounds: in a graph only its capture launches)
@@ -330,6 +331,7 @@ pub const Round = struct {
         rd.pf_fork = null;
         rd.pf_join = null;
         rd.pf_out = false;
+        rd.hot = &.{};
         rd.timer = null;
         return rd;
     }
@@ -377,25 +379,48 @@ pub const Round = struct {
 
     /// These ranges touched into L2 behind the work queued so far, on the prefetch stream.
     /// One paced L2 prefetch launch on its stream at fork `f`'s pace: `ranges` in order, the last one cut where the
-    /// launch reaches `budget` bytes (the served launches move at most 16 MiB, 8 MiB behind wo_b).
-    fn prefetch(rd: *Round, e: *const Engine, ranges: []const [2]u64, f: Fork, budget: u64) !void {
+    /// launch reaches `budget` bytes (the served launches move at most 16 MiB, 8 MiB behind wo_b); `hot` first.
+    fn prefetch(rd: *Round, e: *const Engine, ranges: []const [2]u64, f: Fork, budget: u64, hot: []const ops_mod.Prefetch) !void {
         const s = rd.pf orelse return;
-        var a: ops_mod.Prefetch = .{};
-        var left = budget;
-        for (ranges) |r| {
-            if (r[1] == 0 or a.n == 16 or left == 0) continue;
-            const take = @min(r[1], left);
-            a.ptr[@intCast(a.n)] = r[0];
-            a.bytes[@intCast(a.n)] = take;
-            a.n += 1;
-            left -= take;
+        try forkPrefetch(e, s, rd.pf_fork.?, rd.pf_join.?, &rd.pf_out, hot, ranges, fork_gbps[@intFromEnum(f)], budget);
+    }
+
+    /// TF_DS_L2_HOT: every layer's hot lists (each fork's small tensors ahead of its paced weights).
+    pub fn useHot(rd: *Round, e: *const Engine, gpa: std.mem.Allocator) !void {
+        var sz = try Sizes.init(gpa, e.w);
+        defer sz.deinit(gpa);
+        const ls = e.w.layers;
+        const hot = try gpa.alloc(Hot, ls.len);
+        for (ls, hot, 0..) |lay, *h, li| {
+            h.* = .{};
+            var k: u64 = 0;
+            for (lay.wo_a[0..lay.groups]) |wo| k += wo.k;
+            attnHot(&h.attn, &sz, lay, .{ rd.wo_suh[li], k * 2 });
+            ffnHot(&h.ffn, &sz, lay);
+            if (li + 1 < ls.len) entryHot(&h.next, &sz, ls[li + 1]) else h.next.add(e.w.norm, sz.of(e.w.norm, 0));
         }
-        if (a.n == 0) return;
-        try rd.pf_fork.?.record(e.s);
-        try s.wait(rd.pf_fork.?);
-        try e.ops.l2Prefetch(s, a, fork_gbps[@intFromEnum(f)]);
-        try rd.pf_join.?.record(s);
-        rd.pf_out = true;
+        rd.hot = hot;
+        var n: usize = 0;
+        for (hot) |h| n += h.attn.count() + h.ffn.count() + h.next.count();
+        std.log.info("l2 hot: {d} small ranges a forward", .{n});
+    }
+
+    /// Layer li's hot list at fork f (none without useHot).
+    fn hotOf(rd: *const Round, li: usize, f: Fork) []const ops_mod.Prefetch {
+        if (rd.hot.len == 0) return &.{};
+        const h = &rd.hot[li];
+        return switch (f) {
+            .attn => h.attn.launches(),
+            .ffn => h.ffn.launches(),
+            .next => h.next.launches(),
+        };
+    }
+
+    /// TF_DS_L2_CROSS: an eager fork between graphs, never joined (no later work waits for it; it writes nothing).
+    pub fn detachedPrefetch(rd: *Round, e: *const Engine, hot: []const ops_mod.Prefetch, ranges: []const [2]u64) !void {
+        const s = rd.pf orelse return;
+        var out = false;
+        try forkPrefetch(e, s, rd.pf_fork.?, rd.pf_join.?, &out, hot, ranges, fork_gbps[@intFromEnum(Fork.next)], forkBudget(.next));
     }
 
     /// The main stream waits for the prefetches forked so far (a stretch ends joined: its graph's every stream).
@@ -577,7 +602,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         var r: [5][2]u64 = @splat(.{ 0, 0 });
         for (lay.wo_a[0..lay.groups], 0..) |wo, j| r[j] = linearBytes(wo);
         r[4] = linearBytes(lay.wo_b);
-        try rd.prefetch(e, &r, .attn, forkBudget(.attn));
+        try rd.prefetch(e, &r, .attn, forkBudget(.attn), rd.hotOf(li, .attn));
     }
     try rd.mark(e, .a_q);
     // _kv_idx: the compressor's caches (a kv source) and the indexer's selection
@@ -725,7 +750,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
     try prompt.groupedRotated(e, ch, R, &cb_call);
     // the prefetch behind wo_b: the ffn mix's weights, the router, the shared expert's gate
-    try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, .ffn, forkBudget(.ffn));
+    try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, .ffn, forkBudget(.ffn), rd.hotOf(li, .ffn));
 }
 
 /// Model.moe of a decode window (shared_side off: SHARED_OVERLAP unset in the served lane): the gate's chunk sums
@@ -751,15 +776,15 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     if (li + 1 < e.w.layers.len) {
         const nx = e.w.layers[li + 1];
         if (nx.engram_wkv) |ew| {
-            try rd.prefetch(e, &.{linearBytes(ew)}, .next, forkBudget(.next) / 4);
+            try rd.prefetch(e, &.{linearBytes(ew)}, .next, forkBudget(.next) / 4, rd.hotOf(li, .next));
         } else {
-            try rd.prefetch(e, &.{ .{ nx.hc_attn[0], hcFnBytes(c) }, linearBytes(nx.wq_a), linearBytes(nx.wkv), if (nx.comp_wkv) |x| linearBytes(x) else .{ 0, 0 }, if (nx.comp_wgate) |x| linearBytes(x) else .{ 0, 0 }, linearBytes(nx.wq_b) }, .next, forkBudget(.next));
+            try rd.prefetch(e, &.{ .{ nx.hc_attn[0], hcFnBytes(c) }, linearBytes(nx.wq_a), linearBytes(nx.wkv), if (nx.comp_wkv) |x| linearBytes(x) else .{ 0, 0 }, if (nx.comp_wgate) |x| linearBytes(x) else .{ 0, 0 }, linearBytes(nx.wq_b) }, .next, forkBudget(.next), rd.hotOf(li, .next));
         }
-    } else try rd.prefetch(e, &.{linearBytes(e.w.head)}, .next, forkBudget(.next));
+    } else try rd.prefetch(e, &.{linearBytes(e.w.head)}, .next, forkBudget(.next), rd.hotOf(li, .next));
 }
 
 /// An EXL3 linear's words: their first byte and length (k * n values of k2 / 2 bits).
-fn linearBytes(l: weights.Linear) [2]u64 {
+pub fn linearBytes(l: weights.Linear) [2]u64 {
     return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
 }
 
@@ -771,7 +796,7 @@ const served_gbps: f64 = 230.0;
 pub var fork_budget = served_budget;
 pub var fork_gbps: [3]f64 = @splat(served_gbps);
 
-fn forkBudget(f: Fork) u64 {
+pub fn forkBudget(f: Fork) u64 {
     return fork_budget[@intFromEnum(f)];
 }
 
@@ -792,8 +817,132 @@ pub fn prefetchEnv() void {
 }
 
 /// An mHC mix's weights hc_*_fn: fp32 [24, hc * d].
-fn hcFnBytes(c: anytype) u64 {
+pub fn hcFnBytes(c: anytype) u64 {
     return 24 * @as(u64, c.hc) * c.hidden * 4;
+}
+
+/// A fork of prefetch lane s behind the main stream's queued work: `hot` unpaced, then `ranges` paced (pacedRanges).
+pub fn forkPrefetch(e: *const Engine, s: cuda.Stream, fork: cuda.Event, join: cuda.Event, out: *bool, hot: []const ops_mod.Prefetch, ranges: []const [2]u64, gbps: f64, budget: u64) !void {
+    const a = pacedRanges(ranges, budget);
+    var any = a.n > 0;
+    for (hot) |h| any = any or h.n > 0;
+    if (!any) return;
+    try fork.record(e.s);
+    try s.wait(fork);
+    for (hot) |h| try e.ops.l2PrefetchNow(s, h);
+    try e.ops.l2Prefetch(s, a, gbps);
+    try join.record(s);
+    out.* = true;
+}
+
+/// A paced launch's ranges: in order, the last one cut where they reach `budget` bytes, 16 at most.
+pub fn pacedRanges(ranges: []const [2]u64, budget: u64) ops_mod.Prefetch {
+    var a: ops_mod.Prefetch = .{};
+    var left = budget;
+    for (ranges) |r| {
+        if (r[1] == 0 or a.n == 16 or left == 0) continue;
+        const take = @min(r[1], left);
+        a.ptr[@intCast(a.n)] = r[0];
+        a.bytes[@intCast(a.n)] = take;
+        a.n += 1;
+        left -= take;
+    }
+    return a;
+}
+
+/// TF_DS_L2_HOT: the small tensors a layer's chain reads past each fork; next is the next layer's entry (or the norm).
+pub const Hot = struct { attn: HotList = .{}, ffn: HotList = .{}, next: HotList = .{} };
+
+/// Up to 32 small ranges, as two unpaced launches.
+pub const HotList = struct {
+    pf: [2]ops_mod.Prefetch = .{ .{}, .{} },
+
+    /// A range rounded out to 16-byte units (each starts an allocation or a 16-byte row of one); past 32: dropped.
+    pub fn add(h: *HotList, ptr: u64, bytes: u64) void {
+        if (ptr == 0 or bytes == 0) return;
+        const lo = ptr & ~@as(u64, 15);
+        const hi = std.mem.alignForward(u64, ptr + bytes, 16);
+        for (&h.pf) |*p| {
+            if (p.n == 16) continue;
+            p.ptr[@intCast(p.n)] = lo;
+            p.bytes[@intCast(p.n)] = hi - lo;
+            p.n += 1;
+            return;
+        }
+    }
+
+    pub fn count(h: *const HotList) usize {
+        return @intCast(h.pf[0].n + h.pf[1].n);
+    }
+
+    pub fn launches(h: *const HotList) []const ops_mod.Prefetch {
+        const n: usize = @as(usize, @intFromBool(h.pf[0].n > 0)) + @intFromBool(h.pf[1].n > 0);
+        return h.pf[0..n];
+    }
+};
+
+/// The byte length of each tensor the loader uploaded as an allocation of its own (weights.Named), by its pointer.
+pub const Sizes = struct {
+    map: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+
+    pub fn init(gpa: std.mem.Allocator, w: *const weights.Weights) !Sizes {
+        var s: Sizes = .{};
+        for (w.named.items) |n| try s.map.put(gpa, n.ptr, n.len);
+        return s;
+    }
+
+    pub fn deinit(s: *Sizes, gpa: std.mem.Allocator) void {
+        s.map.deinit(gpa);
+    }
+
+    pub fn of(s: *const Sizes, ptr: u64, fallback: u64) u64 {
+        return s.map.get(ptr) orelse fallback;
+    }
+};
+
+/// A layer's (or drafter block's) entry past the fork before it: the attention mix, attn_in, q_kv_norm and wq_b.
+pub fn entryHot(h: *HotList, sz: *const Sizes, lay: weights.Layer) void {
+    h.add(lay.attn_norm, sz.of(lay.attn_norm, 0));
+    h.add(lay.hc_attn[1], sz.of(lay.hc_attn[1], 0));
+    h.add(lay.hc_attn[2], sz.of(lay.hc_attn[2], 0));
+    for ([_]?weights.Linear{ lay.wq_a, lay.wkv, lay.comp_wkv, lay.comp_wgate, lay.wq_b, lay.idx_wq_b, lay.idx_wk, lay.engram_wkv }) |ol| {
+        const l = ol orelse continue;
+        h.add(l.suh, sz.of(l.suh, @as(u64, l.k) * 2));
+        h.add(l.svh, sz.of(l.svh, @as(u64, l.n) * 2));
+    }
+    for ([_]u64{ lay.q_norm, lay.kv_norm, lay.comp_norm, lay.idx_k_norm, lay.engram_qk }) |p| h.add(p, sz.of(p, 0));
+}
+
+/// Past q's linears: the sink, the merge's rotation (the target's wo_suh, else each wo_a group's suh), wo_a and wo_b.
+pub fn attnHot(h: *HotList, sz: *const Sizes, lay: weights.Layer, wo_suh: ?[2]u64) void {
+    h.add(lay.sink, sz.of(lay.sink, 0));
+    if (wo_suh) |ws| h.add(ws[0], ws[1]);
+    for (lay.wo_a[0..lay.groups]) |wo| {
+        if (wo_suh == null) h.add(wo.suh, sz.of(wo.suh, @as(u64, wo.k) * 2));
+        h.add(wo.svh, sz.of(wo.svh, @as(u64, wo.n) * 2));
+    }
+    h.add(lay.wo_b.suh, sz.of(lay.wo_b.suh, @as(u64, lay.wo_b.k) * 2));
+    h.add(lay.wo_b.svh, sz.of(lay.wo_b.svh, @as(u64, lay.wo_b.n) * 2));
+}
+
+/// Past wo_b: the FFN mix's norm, scale and base, the routing bias, the shared expert's rows (every row routes it).
+pub fn ffnHot(h: *HotList, sz: *const Sizes, lay: weights.Layer) void {
+    h.add(lay.ffn_norm, sz.of(lay.ffn_norm, 0));
+    h.add(lay.hc_ffn[1], sz.of(lay.hc_ffn[1], 0));
+    h.add(lay.hc_ffn[2], sz.of(lay.hc_ffn[2], 0));
+    h.add(lay.gate_b, sz.of(lay.gate_b, 0));
+    const x = lay.experts;
+    if (x.count == 0) return;
+    const sh: u64 = x.count - 1;
+    const d: u64 = x.dims;
+    const i: u64 = x.width;
+    const dn: u64 = x.down_n;
+    h.add(x.suh_g + sh * d * 2, d * 2);
+    h.add(x.suh_u + sh * d * 2, d * 2);
+    h.add(x.svh_g + sh * i * 2, i * 2);
+    h.add(x.svh_u + sh * i * 2, i * 2);
+    h.add(x.suh_d + sh * i * 2, i * 2);
+    h.add(x.svh_d + sh * dn * 2, dn * 2);
 }
 
 /// A round's GPU time by phase (tf-dsv41-lanes --profile 2): a timing event on the main stream at each phase's end,

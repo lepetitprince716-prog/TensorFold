@@ -135,6 +135,9 @@ pub const Model = struct {
     clk_ph: [256]u64 = @splat(0), // by the phase of the clock that ends it
     clk_cnt: [256]u64 = @splat(0),
     clk_rounds: u64 = 0,
+    clk_serve: bool = false, // TF_DS_CLOCK_SERVE: the clocks read after the round's own sync, logged every 256 rounds
+    clk_pending: bool = false, // a forward's clocks not read yet
+    cross: bool = false, // TF_DS_L2_CROSS: the drafter's block 0 entry touched into L2 behind each drafting forward
     t_forward: u64 = 0,
     t_absorb: u64 = 0,
     // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
@@ -172,6 +175,12 @@ pub const Model = struct {
         m.t_enqueue = 0;
         m.t_forward = 0;
         m.t_absorb = 0;
+        m.clk_ph = @splat(0);
+        m.clk_cnt = @splat(0);
+        m.clk_rounds = 0;
+        m.clk_serve = false;
+        m.clk_pending = false;
+        m.cross = false;
         m.dpool = null;
         m.dr = null;
         m.tables = null;
@@ -301,6 +310,7 @@ pub const Model = struct {
                 m.dr.?.graphs = &m.pgraphs.?;
             }
         }
+        try m.useArch(a, o.prefetch);
         try m.stream.synchronize();
         try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize"); // the setup's legacy-stream copies too
 
@@ -358,6 +368,7 @@ pub const Model = struct {
         }
         m.rd.dropSide(&m.eng);
         m.rd.dropPrefetch();
+        if (m.dr) |*dr| dr.dropPrefetch();
         if (m.aio) |x| x.deinit();
         if (m.paio) |x| x.deinit();
         if (m.epool) |p| p.deinit(m.gpa);
@@ -723,19 +734,8 @@ pub const Model = struct {
             try m.stream.synchronize();
             m.t_forward = m.now() - t0;
             if (m.timer) |t| try t.finish();
-            if (m.rd.clk != 0) {
-                var h: [1 + 2 * round.Round.max_clocks]u64 = undefined;
-                const d = m.ctx.d;
-                try d.check(d.api.cuMemcpyDtoH_v2(&h, m.rd.clk, h.len * 8), "cuMemcpyDtoH");
-                const n = @min(h[0], round.Round.max_clocks);
-                for (1..n) |i| {
-                    const tag = h[2 + 2 * i] & 0xff;
-                    m.clk_ph[tag] += h[1 + 2 * i] -% h[1 + 2 * (i - 1)];
-                    m.clk_cnt[tag] += 1;
-                }
-                m.clk_rounds += 1;
-            }
-        }
+            if (m.rd.clk != 0) try m.clockRead();
+        } else if (m.clk_serve) m.clk_pending = true;
         const t1 = m.now();
         if (m.dr) |*dr| {
             const wins = rows.windows orelse return error.BadRound;
@@ -747,10 +747,79 @@ pub const Model = struct {
                 n += 1;
             }
             if (n > 0) try dr.absorbMany(e, &m.ch, &m.dpool.?, items[0..n]);
+            if (n > 0 and m.cross) {
+                // TF_DS_L2_CROSS: block 0's entry into L2 while the argmax, the host's accept and the pass's launch run
+                const er = dr.entryRanges(e);
+                try m.rd.detachedPrefetch(e, dr.first.launches(), &er);
+            }
         }
         // wait false: the caller's read next (roundArgmax, roundLogits) waits, so the argmax queues with no idle gap
         if (wait or m.prof) try m.stream.synchronize();
         if (m.prof) m.t_absorb = m.now() - t1;
+        if (wait) try m.clockServe();
+    }
+
+    /// The arch program's knobs, every rank alike (L2_HOT, _DRAFT, _CROSS need the prefetch; CLOCK_SERVE; NOGEMV).
+    fn useArch(m: *Model, a: std.mem.Allocator, prefetch: bool) !void {
+        if (prefetch) {
+            if (envOn("TF_DS_L2_HOT")) try m.rd.useHot(&m.eng, a);
+            if (m.dr) |*dr| try dr.usePrefetch(&m.eng, a, envOn("TF_DS_L2_DRAFT"), envOn("TF_DS_L2_CROSS"));
+            m.cross = m.dr != null and envOn("TF_DS_L2_CROSS");
+        }
+        if (std.c.getenv("TF_DS_CLOCK_SERVE")) |v| {
+            const marks = std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0;
+            if (marks > 0 and marks <= 3) {
+                try m.useClock(marks);
+                m.clk_serve = true;
+                std.log.info("round clocks every 256 rounds, marks {d}", .{marks});
+            }
+        }
+        if (envOn("TF_DS_EXP_NOGEMV")) {
+            exl3_linear.skip_gemv = true;
+            exl3_experts.skip_decode = true;
+            std.log.warn("TF_DS_EXP_NOGEMV: decode linears and experts skipped (a timing experiment: outputs are garbage)", .{});
+        }
+    }
+
+    /// The last forward's GPU clocks summed by the phase or layer of the clock ending each gap (Model.clk_ph).
+    fn clockRead(m: *Model) !void {
+        var h: [1 + 2 * round.Round.max_clocks]u64 = undefined;
+        const d = m.ctx.d;
+        try d.check(d.api.cuMemcpyDtoH_v2(&h, m.rd.clk, h.len * 8), "cuMemcpyDtoH");
+        const n = @min(h[0], round.Round.max_clocks);
+        for (1..n) |i| {
+            const tag = h[2 + 2 * i] & 0xff;
+            m.clk_ph[tag] += h[1 + 2 * i] -% h[1 + 2 * (i - 1)];
+            m.clk_cnt[tag] += 1;
+        }
+        m.clk_rounds += 1;
+    }
+
+    /// TF_DS_CLOCK_SERVE, after a sync the round makes anyway: the clocks added; every 256 rounds one log line.
+    fn clockServe(m: *Model) !void {
+        if (!m.clk_pending) return;
+        m.clk_pending = false;
+        try m.clockRead();
+        if (m.clk_rounds < 256) return;
+        var buf: [8192]u8 = undefined;
+        var at: usize = 0;
+        const r: f64 = @floatFromInt(m.clk_rounds);
+        const names = round.PhaseTimer.phases;
+        for (0..256) |i| {
+            if (m.clk_cnt[i] == 0) continue;
+            const us = @as(f64, @floatFromInt(m.clk_ph[i])) / r / 1e3;
+            const per = @as(f64, @floatFromInt(m.clk_cnt[i])) / r;
+            const sep = if (at == 0) "" else ", ";
+            const got = if (i >= 64 and i < 128)
+                std.fmt.bufPrint(buf[at..], "{s}\"L{d}\": [{d:.1}, {d:.1}]", .{ sep, i - 64, us, per })
+            else
+                std.fmt.bufPrint(buf[at..], "{s}\"{s}\": [{d:.1}, {d:.1}]", .{ sep, clockName(names, i), us, per });
+            at += (got catch break).len;
+        }
+        std.log.info("round clocks: {{\"rounds\": {d}, {s}}}", .{ m.clk_rounds, buf[0..at] });
+        m.clk_ph = @splat(0);
+        m.clk_cnt = @splat(0);
+        m.clk_rounds = 0;
     }
 
     /// The rounds' GPU clocks (a profile): the forward's start and each stretch's ends, for its gaps.
@@ -787,6 +856,7 @@ pub const Model = struct {
         try m.ops.argmaxRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, m.amax);
         try m.stream.synchronize();
         try d.check(d.api.cuMemcpyDtoH_v2(&m.amax_host, m.amax, R * 4), "cuMemcpyDtoH");
+        try m.clockServe();
         return m.amax_host[0..R];
     }
 
@@ -794,6 +864,7 @@ pub const Model = struct {
         const d = m.ctx.d;
         try m.stream.synchronize();
         try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.rd.logits, R * m.vocab * 4), "cuMemcpyDtoH");
+        try m.clockServe();
         return m.logits[0 .. R * m.vocab];
     }
 
@@ -815,3 +886,20 @@ pub const Model = struct {
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
     }
 };
+
+/// An env switch set to "1".
+fn envOn(name: [*:0]const u8) bool {
+    const v = std.c.getenv(name) orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+/// A clock tag's name in the round clocks line: the profile's phase, or the stretch marks.
+fn clockName(names: anytype, i: usize) []const u8 {
+    if (i < names.len) return names[i];
+    return switch (i) {
+        round.Round.clock_start => "start",
+        round.Round.clock_wait => "wait",
+        round.Round.clock_tail => "tail",
+        else => "other",
+    };
+}

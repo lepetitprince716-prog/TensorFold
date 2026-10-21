@@ -7,8 +7,8 @@
 //! the sparse attention over the stream's 128 newest absorbed positions and its own block rows; wo_a's epilogue
 //! rotating wo_b's rows; the MoE at top 3 of the routed experts and the shared one), the Markov loop (markov.py: the
 //! vocabulary split over the ranks, the bias rows of 256 frequent tokens cached, each step's bests gathered) and the
-//! confidence head (one fp32 GEMV as torch issues it). The served L2 prefetch forks move no bytes and are left out; the
-//! RDMA gathers are NCCL all-gathers (the same bytes).
+//! confidence head (one fp32 GEMV as torch issues it). The served L2 prefetch forks move no bytes (TF_DS_L2_DRAFT has
+//! them, Drafter.usePrefetch); the RDMA gathers are NCCL all-gathers (the same bytes).
 const std = @import("std");
 const cuda = @import("cuda");
 const prompt = @import("prompt.zig");
@@ -24,6 +24,7 @@ const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const markov_tokens = @import("markov_tokens.zig");
 const draft2d = @import("draft2d.zig");
+const round = @import("round.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -153,6 +154,9 @@ pub const PassGraphs = struct {
     }
 };
 
+/// TF_DS_L2_CROSS behind a pass: the target's layer 0 entry (its small tensors, its mix's fn and input linears).
+pub const Cross = struct { hot: round.HotList = .{}, ranges: [6][2]u64 = @splat(.{ 0, 0 }) };
+
 pub const Drafter = struct {
     ds: weights.DSpark,
     n: usize, // a stream's block rows: [token, noise x (n - 1)]
@@ -228,6 +232,15 @@ pub const Drafter = struct {
     arows: u64,
     // the pass's graphs (BatchDraftGraph: one a streams and steps; null: eager)
     graphs: ?*PassGraphs = null,
+    // usePrefetch: the pass's prefetch lane, its forks' small tensors by block, block 0's entry, the target's layer 0
+    pf: ?cuda.Stream = null,
+    pf_fork: ?cuda.Event = null,
+    pf_join: ?cuda.Event = null,
+    pf_out: bool = false,
+    forks: bool = false,
+    hot: []const round.Hot = &.{},
+    first: round.HotList = .{},
+    cross: ?Cross = null,
     // the last pass on the host: each stream's drafts and confidences (`steps` of them)
     streams: usize = 0,
     steps: usize = 0,
@@ -256,6 +269,14 @@ pub const Drafter = struct {
         dr.streams = 0;
         dr.steps = 0;
         dr.graphs = null;
+        dr.pf = null;
+        dr.pf_fork = null;
+        dr.pf_join = null;
+        dr.pf_out = false;
+        dr.forks = false;
+        dr.hot = &.{};
+        dr.first = .{};
+        dr.cross = null;
         dr.rows = try a.take(6 * R * 8);
         dr.bidx = try a.take(R * pick_pad * 8);
         dr.wlo = try a.take(8);
@@ -357,6 +378,78 @@ pub const Drafter = struct {
         dr.apos = try a.take(ring * 8);
         dr.arows = try a.take(ring * 8);
         return dr;
+    }
+
+    /// TF_DS_L2_DRAFT (forks: the target's three forks in every block) and TF_DS_L2_CROSS: a prefetch lane of its own.
+    pub fn usePrefetch(dr: *Drafter, e: *const Engine, gpa: std.mem.Allocator, forks: bool, cross: bool) !void {
+        if (dr.pf != null or !(forks or cross)) return;
+        var sz = try round.Sizes.init(gpa, e.w);
+        defer sz.deinit(gpa);
+        const bs = dr.ds.blocks;
+        round.entryHot(&dr.first, &sz, bs[0]);
+        if (forks) {
+            const hot = try gpa.alloc(round.Hot, bs.len);
+            for (bs, hot, 0..) |lay, *h, j| {
+                h.* = .{};
+                round.attnHot(&h.attn, &sz, lay, null);
+                round.ffnHot(&h.ffn, &sz, lay);
+                if (j + 1 < bs.len) round.entryHot(&h.next, &sz, bs[j + 1]) else h.next.add(dr.ds.norm, sz.of(dr.ds.norm, 0));
+            }
+            dr.hot = hot;
+        }
+        var x: ?Cross = null;
+        if (cross) {
+            const l0 = e.w.layers[0];
+            x = .{};
+            round.entryHot(&x.?.hot, &sz, l0);
+            const lb = round.linearBytes;
+            x.?.ranges = .{ .{ l0.hc_attn[0], round.hcFnBytes(e.c) }, lb(l0.wq_a), lb(l0.wkv), if (l0.comp_wkv) |y| lb(y) else .{ 0, 0 }, if (l0.comp_wgate) |y| lb(y) else .{ 0, 0 }, lb(l0.wq_b) };
+        }
+        // the lane last: nothing above can fail with a stream made
+        var s = try cuda.Stream.init(e.d, true);
+        errdefer s.deinit();
+        var fork = try cuda.Event.init(e.d, false);
+        errdefer fork.deinit();
+        dr.pf_join = try cuda.Event.init(e.d, false);
+        dr.pf_fork = fork;
+        dr.pf = s;
+        dr.forks = forks;
+        dr.cross = x;
+        std.log.info("drafter l2 prefetch: forks {}, cross {}", .{ forks, cross });
+    }
+
+    /// Block 0's entry weights (Model's cross prefetch behind a forward): its attention mix's fn and its input linears.
+    pub fn entryRanges(dr: *const Drafter, e: *const Engine) [4][2]u64 {
+        const b = dr.ds.blocks[0];
+        return .{ .{ b.hc_attn[0], round.hcFnBytes(e.c) }, round.linearBytes(b.wq_a), round.linearBytes(b.wkv), round.linearBytes(b.wq_b) };
+    }
+
+    /// A fork of the pass (TF_DS_L2_DRAFT): block j's small tensors at fork f, then `ranges` at f's pace and budget.
+    fn prefetch(dr: *Drafter, e: *const Engine, j: usize, f: round.Fork, ranges: []const [2]u64) !void {
+        if (!dr.forks) return;
+        const h = &dr.hot[j];
+        const hot = switch (f) {
+            .attn => h.attn.launches(),
+            .ffn => h.ffn.launches(),
+            .next => h.next.launches(),
+        };
+        try round.forkPrefetch(e, dr.pf.?, dr.pf_fork.?, dr.pf_join.?, &dr.pf_out, hot, ranges, round.fork_gbps[@intFromEnum(f)], round.forkBudget(f));
+    }
+
+    pub fn dropPrefetch(dr: *Drafter) void {
+        if (dr.pf_fork) |*x| x.deinit();
+        if (dr.pf_join) |*x| x.deinit();
+        if (dr.pf) |*s| s.deinit();
+        dr.pf_fork = null;
+        dr.pf_join = null;
+        dr.pf = null;
+    }
+
+    /// The main stream waits for the pass's forks (a pass graph ends joined).
+    fn joinPrefetch(dr: *Drafter, e: *const Engine) !void {
+        if (!dr.pf_out) return;
+        try e.s.wait(dr.pf_join.?);
+        dr.pf_out = false;
     }
 
     fn row(dr: *const Drafter, i: usize) u64 {
@@ -467,6 +560,11 @@ pub const Drafter = struct {
         for (0..N) |i| ho[i * ts] = tokens[i];
         try prompt.upload(e, dr.out, &ho, N * ts * 8);
         if (dr.graphs != null and probe == null) try dr.graphs.?.run(dr, e, ch, pool, N, steps) else try dr.body(e, ch, pool, N, steps, probe);
+        if (dr.cross) |*x| {
+            // TF_DS_L2_CROSS: the target's layer 0 entry into L2 while the host reads the drafts and plans the round
+            var out = false;
+            try round.forkPrefetch(e, dr.pf.?, dr.pf_fork.?, dr.pf_join.?, &out, x.hot.launches(), &x.ranges, round.fork_gbps[@intFromEnum(round.Fork.next)], round.forkBudget(.next));
+        }
         // one host read: the drafts and the confidences
         try e.s.synchronize();
         var hc: [max_streams * max_block]f32 = undefined;
@@ -540,6 +638,7 @@ pub const Drafter = struct {
         try e.ops.copyRows(e.s, dr.xcf, d * 4, dr.conf_in, w * 4, d * 4, N * steps);
         try e.ops.copyRows(e.s, dr.ef, rank * 4, dr.conf_in + d * 4, w * 4, rank * 4, N * steps);
         try e.blas.xv(dr.conf_in, dr.confw, dr.conf, N * steps, w);
+        try dr.joinPrefetch(e);
     }
 
     /// pre_mix of _stages_fused: hc_pre2 of the streams h with the pending gathered partials posted in (into the spare
@@ -572,6 +671,12 @@ pub const Drafter = struct {
         try tri_norm.rmsnormRot(t, dr.qa, lay.wq_a.n, lay.q_norm, c.eps, &rot, dr.qr, lay.wq_a.n, R, lay.wq_a.n);
         var qc = [_]exl3_linear.Call{.{ .layer = lay.wq_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = dr.xhq, .y = dr.q, .ldy = @intCast(lay.wq_b.n), .y_dtype = .bf16, .counters = 0, .rope = .{ .cos = rope.cos, .sin = rope.sin, .pos = pos, .hd = @intCast(hd), .rd = @intCast(rd) } }};
         try prompt.groupedRotated(e, ch, R, &qc);
+        {
+            var r: [5][2]u64 = @splat(.{ 0, 0 }); // the target's attn fork: this block's wo_a and wo_b
+            for (lay.wo_a[0..lay.groups], 0..) |wo, gi| r[gi] = round.linearBytes(wo);
+            r[4] = round.linearBytes(lay.wo_b);
+            try dr.prefetch(e, j, .attn, &r);
+        }
         // the block rows' keys: normed and roped, stored nowhere (ring row -1)
         const plane_rows = pool.slots * pool.ring;
         try tri_norm.kvNormRope(t, dr.ykv, lay.kv_norm, rope.cos, rope.sin, pos, pool.rings[j], plane_rows, dr.row(5), c.eps, true, rd, dr.kvb, R, hd);
@@ -614,6 +719,9 @@ pub const Drafter = struct {
         try exl3_linear.glinear(e.lin, e.s, calls[0..lay.groups], R, ch.gz, true, true);
         var cb = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = dr.xb, .y = dr.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
         try prompt.groupedRotated(e, ch, R, &cb);
+        const ne: u64 = lay.experts.count - 1;
+        const x = lay.experts;
+        try dr.prefetch(e, j, .ffn, &.{ .{ lay.hc_ffn[0], round.hcFnBytes(c) }, .{ lay.gate_w, ne * c.hidden * 2 }, x.shared_gate, x.shared_up, x.shared_down });
     }
 
     /// Model.moe(lay, x, topk) of a pass's rows: the gate's chunk sums (rowmm_gate; past decode_rows rows the gate's fp32
@@ -633,8 +741,15 @@ pub const Drafter = struct {
         }
         try tri_norm.route(e.t, dr.gl, kc, lay.gate_b, dr.topk, c.routed_scaling, lay.experts.count - 1, dr.pick, dr.mw, R, ne, dr.slots_moe);
         // routed(): fewer than EXACT_ROWS rows take the decode window's fused path, more the chunk's (13+ streams)
-        if (R < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, dr.xsd, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);
-        try exl3_experts.prompt(e.ex, e.s, lay.experts, dr.xs, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);
+        if (R < exl3_experts.exact_rows) {
+            try exl3_experts.decode(e.ex, e.s, lay.experts, dr.xsd, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);
+        } else try exl3_experts.prompt(e.ex, e.s, lay.experts, dr.xs, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);
+        // the target's next fork: the next block's mix fn and input linears, after the last block the head
+        const bs = dr.ds.blocks;
+        if (j + 1 < bs.len) {
+            const nx = bs[j + 1];
+            try dr.prefetch(e, j, .next, &.{ .{ nx.hc_attn[0], round.hcFnBytes(c) }, round.linearBytes(nx.wq_a), round.linearBytes(nx.wkv), round.linearBytes(nx.wq_b) });
+        } else try dr.prefetch(e, j, .next, &.{round.linearBytes(e.w.head)});
     }
 };
 

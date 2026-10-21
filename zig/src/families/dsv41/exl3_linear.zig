@@ -172,9 +172,13 @@ pub fn rotMany(k: *const Kernels, stream: cuda.Stream, calls: []const Call, m: u
     try cuda.launch.launch(k.rot_many, .{ .grid = .{ .x = @intCast((warps + 3) / 4) }, .block = .{ .x = 128 }, .pdl = pdl }, stream, &args);
 }
 
+/// TF_DS_EXP_NOGEMV (Model.open): every glinear launch skipped, a timing experiment of the chain alone (garbage out).
+pub var skip_gemv = false;
+
 /// The glinear launches of a group (Exl3Group.rotated, with each call's folds): each (bits, codebook, warps) set in
 /// first-seen order, its split layers' partials in z (fp32, SK * M * N floats each, in order).
 pub fn glinear(k: *const Kernels, stream: cuda.Stream, calls: []const Call, m: usize, z: u64, pdl: bool, discard: bool) !void {
+    if (skip_gemv) return;
     var done: [gmax]bool = @splat(false);
     for (calls, 0..) |first, i| {
         if (done[i]) continue;

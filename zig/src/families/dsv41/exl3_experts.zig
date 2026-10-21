@@ -345,6 +345,9 @@ pub const DecodeLaunch = struct {
     args: cuda.Args = .{},
 };
 
+/// TF_DS_EXP_NOGEMV (Model.open): every decode window's three launches skipped (a timing experiment, garbage out).
+pub var skip_decode = false;
+
 /// routed(x, pick, wts, ex, s, None, R, limit, ACT_F32, before_down=None, shared_slot=slots - 1) on a decode window
 /// (R < 64), the served Model.moe's one call a layer: out fp32 [R, D] = each row's slots' expert outputs weighted by
 /// wts, summed in slot order. x bf16 [R, D] (row stride x_stride elements), pick int32 and wts fp32 [R, slots]
@@ -353,6 +356,7 @@ pub const DecodeLaunch = struct {
 /// before_down nothing waits before down. Three launches on `s`: decode_prep plain, gate / up and down as programmatic
 /// dependents.
 pub fn decode(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride: usize, pick: u64, wts: u64, out: u64, r: usize, limit: f32) !void {
+    if (skip_decode) return;
     var ls = try decodeLaunches(ex, sc, x, x_stride, pick, wts, out, r, limit);
     var fs: [3]cuda.Function = undefined;
     for (&ls, &fs) |*l, *f| f.* = switch (l.kernel) {

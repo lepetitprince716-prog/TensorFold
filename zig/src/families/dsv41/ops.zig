@@ -193,6 +193,16 @@ pub const Ops = struct {
         try cuda.launch.launch(o.l2_prefetch, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, s, &a);
     }
 
+    /// The same kernel unpaced (no delay, every chunk at once): a fork's small tensors ahead of its paced weights.
+    pub fn l2PrefetchNow(o: *const Ops, s: cuda.Stream, pf: Prefetch) !void {
+        if (pf.n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(pf);
+        a.add(@as(c_longlong, 0));
+        a.add(@as(c_longlong, 0));
+        try cuda.launch.launch(o.l2_prefetch, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, s, &a);
+    }
+
     /// The indexer's selection of every scanned key (its top-k takes all nb): out [rows, nb] int64 = j where j <
     /// vis[r], else -1 (vis [rows] int64), on the device.
     pub fn iotaVis(o: *const Ops, s: cuda.Stream, vis: u64, out: u64, nb: usize, rows: usize) !void {
