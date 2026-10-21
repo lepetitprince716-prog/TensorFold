@@ -1026,7 +1026,7 @@ pub const Lanes = struct {
         errdefer self.gpa.destroy(sn);
         sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
         errdefer sn.buf.free();
-        try self.snaps.append(self.gpa, sn);
+        try self.snaps.ensureUnusedCapacity(self.gpa, 1); // (listed below, once saved: a failure frees `sn` unlisted)
         self.next_snap += 1;
         if (try self.begin(.snap_save)) {
             try self.wire.int(self.gpa, u64, sn.id);
@@ -1035,6 +1035,7 @@ pub const Lanes = struct {
         }
         errdefer self.wire.refuse();
         try self.m.snapCopy(l.slot, sn.buf.ptr, true);
+        self.snaps.appendAssumeCapacity(sn);
         return sn;
     }
 
@@ -1575,6 +1576,36 @@ test "a prefix two conversations share: the second one resuming it in place woul
     try ln.snaps.append(std.testing.allocator, &later);
     try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
+}
+
+test "a save that failed after its state was made leaves nothing in the list" {
+    const gpa = std.testing.allocator;
+    var drv: cuda.Driver = undefined; // (a zero-byte buffer, which this model's snapshot is, never reaches the driver)
+    var ctx: cuda.Context = undefined;
+    ctx.d = &drv;
+    var no_rings: [0]u64 = .{};
+    var m: Model = undefined;
+    m.ctx = &ctx;
+    m.rings = &no_rings;
+    m.eng.c = &m.cfg;
+    m.cfg.window = 0;
+    m.cfg.head_dim = 0;
+    m.cfg.layers = 0;
+    const prompt = try gpa.alloc(u32, 2 * model.chunk_rows);
+    defer gpa.free(prompt);
+    @memset(prompt, 1);
+    var s = try lanes.Stream.init(gpa, .{ .id = "t", .prompt = prompt, .max_new = 8, .sampling = null });
+    defer s.deinit(gpa);
+    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = .{ .fd = -1 } };
+    defer ln.streams.deinit(gpa);
+    try ln.streams.put(gpa, &s, .{ .slot = 0, .base = 0, .end = 4096 });
+    var fail = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 2 }); // the Snap, the list's room, then the frame
+    ln.gpa = fail.allocator();
+    defer ln.snaps.deinit(ln.gpa);
+    defer ln.wire.deinit(ln.gpa);
+    try std.testing.expectError(error.OutOfMemory, ln.snapSave(&s, model.chunk_rows));
+    try std.testing.expectEqual(@as(usize, 0), ln.snaps.items.len);
+    try std.testing.expectEqual(@as(u64, 2), ln.next_snap); // (an id is never used twice: rank 1 keeps states by it)
 }
 
 test "a sampling the sampler cannot draw is refused before a frame is built" {
