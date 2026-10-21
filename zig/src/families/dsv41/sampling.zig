@@ -25,6 +25,11 @@ pub const max_candidates = 64;
 /// The largest top_k a row is drawn with: its top_k + MARGIN candidates must fit max_candidates.
 pub const max_top_k = max_candidates - margin;
 
+/// A candidate as the device selects it (dsv41_candidates.cuh TfDsCandidate): a logit as stored and its column.
+pub const Candidate = extern struct { value: f32, id: u32 };
+/// The id the device gives every candidate of a row that holds a NaN: such a row is drawn from the host's logits.
+pub const nan_row: u32 = 0xfffffffe;
+
 extern "c" fn exp(x: f64) f64;
 extern "c" fn log(x: f64) f64;
 
@@ -108,6 +113,15 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
     var values: [max_candidates]f32 = undefined;
     var ids: [max_candidates]i64 = undefined;
     const width = topCandidates(row, count, &values, &ids);
+    return sampleCandidates(values[0..width], ids[0..width], position, s);
+}
+
+/// sample_rows for a row's candidates in topCandidates' order, host's or device's: the token (top_k of them count).
+pub fn sampleCandidates(values: []const f32, ids: []const i64, position: u64, s: Sampling) !i64 {
+    if (values.len == 0 or values.len != ids.len or values.len > max_candidates) return error.BadCandidates;
+    if (s.temperature <= 0) return ids[0];
+    if (s.top_k == 0) return error.NotPortedYet;
+    const width = values.len;
     // choose_rows on the candidates (already in lexsort's order)
     const k = @max(1, @min(s.top_k, width));
     const t = @max(s.temperature, 1e-6);
@@ -177,4 +191,49 @@ test "top candidates by value, then id" {
     try std.testing.expectEqual(@as(usize, 4), topCandidates(&row, 4, &v, &ids));
     try std.testing.expectEqualSlices(i64, &.{ 1, 3, 5, 2 }, &ids);
     try std.testing.expectEqualSlices(f32, &.{ 5, 5, 5, 3 }, &v);
+}
+
+test "top candidates: -0.0 equals +0.0, the infinities order, and the logits keep their bits (what the device must list)" {
+    const inf = std.math.inf(f32);
+    const row = [_]f32{ -0.0, 0.0, -inf, 1, inf, -0.0, 0.0, -inf, 1 };
+    var v: [9]f32 = undefined;
+    var ids: [9]i64 = undefined;
+    try std.testing.expectEqual(@as(usize, 9), topCandidates(&row, 9, &v, &ids));
+    try std.testing.expectEqualSlices(i64, &.{ 4, 3, 8, 0, 1, 5, 6, 2, 7 }, &ids);
+    for (v, ids) |x, id| try std.testing.expectEqual(@as(u32, @bitCast(row[@intCast(id)])), @as(u32, @bitCast(x)));
+    // fewer than asked: the first three of the same row
+    try std.testing.expectEqual(@as(usize, 3), topCandidates(&row, 3, &v, &ids));
+    try std.testing.expectEqualSlices(i64, &.{ 4, 3, 8 }, ids[0..3]);
+}
+
+test "a candidate is the device's eight bytes, the logit then its column, and a NaN row's mark is no column" {
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(Candidate));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Candidate, "value"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(Candidate, "id"));
+    try std.testing.expect(nan_row > 129279 and nan_row < std.math.maxInt(u32)); // above every column, below the padding
+}
+
+test "a list of 64 candidates draws as the row does, whatever the settings (only the first top_k of them count)" {
+    var row: [257]f32 = undefined;
+    for (&row, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 73) % 101)) / 7 - 9;
+    row[0] = -0.0;
+    row[256] = 0.0;
+    var values: [max_candidates]f32 = undefined;
+    var ids: [max_candidates]i64 = undefined;
+    const width = topCandidates(&row, max_candidates, &values, &ids);
+    for ([_]usize{ 1, 2, 20, 56 }) |k| {
+        for ([_]f64{ 0.01, 0.7, 1.0, 2.0 }) |temperature| {
+            for ([_]f64{ 0.1, 0.95, 1.0 }) |p| {
+                for ([_]f64{ 0.0, 0.2 }) |minimum| {
+                    for ([_]u64{ 0, 1, 123456789, 0xffffffffffffffff }) |seed| {
+                        const s: Sampling = .{ .seed = seed, .temperature = temperature, .top_k = k, .top_p = p, .min_p = minimum };
+                        try std.testing.expectEqual(try sampleRow(&row, 999, s), try sampleCandidates(values[0..width], ids[0..width], 999, s));
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expectError(error.BadCandidates, sampleCandidates(&.{}, &.{}, 0, .{ .seed = 0 }));
+    try std.testing.expectError(error.BadCandidates, sampleCandidates(&.{ 1, 2 }, &.{5}, 0, .{ .seed = 0 }));
+    try std.testing.expectError(error.NotPortedYet, sampleCandidates(&.{1}, &.{5}, 0, .{ .seed = 0, .top_k = 0 }));
 }
