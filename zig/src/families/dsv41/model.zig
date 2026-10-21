@@ -442,6 +442,13 @@ pub const Model = struct {
         if (m.rdma_rings) |*rs| for ([_]*rdma.Ring{ rs.all4, rs.col, rs.pair }) |r| r.abort(why);
     }
 
+    /// Why one of this rank's RDMA rings failed (its proxy lost a write or a completion, or it was aborted), else null.
+    pub fn ringFailure(m: *const Model) ?[]const u8 {
+        if (m.ring) |r| if (r.failure()) |why| return why;
+        if (m.rdma_rings) |rs| for ([_]*rdma.Ring{ rs.all4, rs.col, rs.pair }) |r| if (r.failure()) |why| return why;
+        return null;
+    }
+
     pub fn drafting(m: *const Model) bool {
         return m.dr != null;
     }
@@ -908,4 +915,48 @@ fn clockName(names: anytype, i: usize) []const u8 {
         round.Round.clock_tail => "tail",
         else => "other",
     };
+}
+
+/// A ring that never touched a NIC: its failure flag, its reason and the metadata block the abort word lives in.
+fn fakeRing(meta: *align(std.heap.page_size_min) [32]u64) rdma.Ring {
+    var r: rdma.Ring = undefined;
+    r.failed = .init(false);
+    r.why = @splat(0);
+    r.s = .{ .max_bytes = 64 };
+    r.world = 2;
+    r.meta = .{ .mem = @as([*]align(std.heap.page_size_min) u8, @ptrCast(meta))[0 .. @sizeOf(u64) * 32], .dev = 0 };
+    return r;
+}
+
+test "a failed ring shows through the model: TP2's, or any of the 2D split's three" {
+    var m: Model = undefined;
+    m.ring = null;
+    m.rdma_rings = null;
+    try std.testing.expectEqual(@as(?[]const u8, null), m.ringFailure()); // no ring, nothing to fail
+    var meta: [32]u64 align(std.heap.page_size_min) = @splat(0);
+    var a = fakeRing(&meta);
+    m.ring = &a;
+    try std.testing.expectEqual(@as(?[]const u8, null), m.ringFailure());
+    a.abort("ibv_post_send failed");
+    try std.testing.expectEqualStrings("ibv_post_send failed", m.ringFailure().?);
+    try std.testing.expectEqual(@as(u64, 1), meta[a.s.slots * a.world + 1 + 2 * a.s.slots]); // the abort word the kernels read
+    // the 2D split: any one of the three failing shows, and all4 is asked before col and col before pair
+    m.ring = null;
+    const names = [3][]const u8{ "all4 down", "col down", "pair down" };
+    for (0..4) |which| {
+        var ma: [32]u64 align(std.heap.page_size_min) = @splat(0);
+        var mb: [32]u64 align(std.heap.page_size_min) = @splat(0);
+        var mc: [32]u64 align(std.heap.page_size_min) = @splat(0);
+        var rings = [3]rdma.Ring{ fakeRing(&ma), fakeRing(&mb), fakeRing(&mc) };
+        m.rdma_rings = .{ .g = 0, .r = 0, .p = 0, .all4 = &rings[0], .col = &rings[1], .pair = &rings[2] };
+        try std.testing.expectEqual(@as(?[]const u8, null), m.ringFailure());
+        if (which < 3) {
+            rings[which].abort(names[which]);
+            try std.testing.expectEqualStrings(names[which], m.ringFailure().?);
+        } else { // pair first, then col: col is the one named
+            rings[2].abort(names[2]);
+            rings[1].abort(names[1]);
+            try std.testing.expectEqualStrings(names[1], m.ringFailure().?);
+        }
+    }
 }

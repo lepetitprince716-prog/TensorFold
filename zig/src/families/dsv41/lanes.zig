@@ -1112,10 +1112,22 @@ fn cudaFailed(m: *Model, err: anyerror, what: []const u8) void {
     pairBroken(m, std.fmt.bufPrint(&buf, "{s}: CudaFailed on rank {d}", .{ what, m.rank }) catch "CudaFailed");
 }
 
-/// A primitive's result, passed on as it is; an error that is a CUDA failure first breaks the pair.
+/// A primitive's result, passed on as it is; a CUDA failure in it, or a ring that failed, first breaks the pair.
 fn stuck(m: *Model, what: []const u8, result: anytype) @TypeOf(result) {
     if (result) |_| {} else |err| cudaFailed(m, err, what);
+    ringFailed(m);
     return result;
+}
+
+/// Set once a failed ring was said: with TF_DS_PAIR_BROKEN=log every later primitive would say it again.
+var ring_said: std.atomic.Value(bool) = .init(false);
+
+/// A failed ring is a broken pair: its waits end at once, and a replayed graph returns garbage without an error.
+fn ringFailed(m: *Model) void {
+    const why = m.ringFailure() orelse return;
+    if (ring_said.swap(true, .acq_rel)) return;
+    var buf: [160]u8 = undefined;
+    pairBroken(m, std.fmt.bufPrint(&buf, "ring failed: {s}", .{why}) catch "ring failed");
 }
 
 /// This rank's watchdog (null: TF_DS_WATCHDOG_S is 0), whose stall breaks the pair; stop it before the model closes.
@@ -1164,6 +1176,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier, dog: 
         kept.deinit(gpa);
     }
     while (true) {
+        ringFailed(m); // the last frame's rings (a failed one ended the waits, and a replayed graph went on)
         if (dog) |d| d.idle(); // waiting for the next frame is idle
         // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond
         // after this rank's GPU goes idle in a decode; a sleeping thread would add its core's wake-up to every frame)
