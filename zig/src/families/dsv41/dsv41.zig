@@ -48,6 +48,7 @@ pub const draft = @import("draft.zig");
 pub const sampling = @import("sampling.zig");
 pub const model = @import("model.zig");
 pub const lanes = @import("lanes.zig");
+pub const spill = @import("spill.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -94,4 +95,5 @@ test {
     refAll(sampling);
     refAll(model);
     refAll(lanes);
+    refAll(spill);
 }
