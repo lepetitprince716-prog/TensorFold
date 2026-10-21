@@ -529,7 +529,7 @@ pub const Lanes = struct {
         if (try self.begin(kind)) try self.flushLoose();
     }
 
-    fn busy(self: *Lanes, name: []const u8) void {
+    pub fn busy(self: *Lanes, name: []const u8) void {
         if (self.dog) |d| d.busy(name);
     }
 
@@ -537,7 +537,7 @@ pub const Lanes = struct {
         if (self.dog) |d| d.tick();
     }
 
-    fn idle(self: *Lanes) void {
+    pub fn idle(self: *Lanes) void {
         if (self.dog) |d| d.idle();
     }
 

@@ -183,6 +183,8 @@ pub fn knownFn(ptr: *anyopaque, dir: [:0]const u8, keys: []const u64) u8 {
     t.sp.open(dir) catch return 2;
     t.sp.keepOnly(keys) catch {};
     var peers = std.hash.Wyhash.init(0);
+    ln.busy("spill_sync"); // the exchange waits on every follower's answer: one that never comes ends the pair
+    defer ln.idle();
     if (ln.begin(.spill_sync) catch return 2) {
         ln.wire.int(ln.gpa, u32, @intCast(keys.len)) catch return 2;
         for (keys) |k| ln.wire.int(ln.gpa, u64, k) catch return 2;
