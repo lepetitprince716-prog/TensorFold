@@ -23,6 +23,7 @@ const link = @import("link.zig");
 const cuda = @import("cuda");
 const spill = @import("spill.zig");
 const spill_lanes = @import("spill_lanes.zig");
+const watchdog = @import("watchdog.zig");
 
 const be = lanes.backend;
 const Model = model.Model;
@@ -38,17 +39,38 @@ pub const image_piece = 32 << 10;
 /// A gate's diagnostic (the tools' --logits-sha 1): each prompt's logits' sha256 on stderr.
 pub var logits_sha = false;
 
-/// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
+/// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, outcome u8, its fields little-endian).
 pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, spill_sync = 10, spill_write = 11, spill_load = 12, spill_forget = 13 };
+
+/// Whether the ranks compare outcomes at this frame: the pair's device work, not snap_drop, done or a spill frame.
+pub fn checked(kind: Kind) bool {
+    return switch (kind) {
+        .fill_begin, .fill_chunk, .verify, .pass, .fill_images, .snap_save, .snap_restore => true,
+        .snap_drop, .done, .spill_sync, .spill_write, .spill_load, .spill_forget => false,
+    };
+}
+
+/// A checked primitive's outcome byte: it ran to its end on a rank, or that rank refused it (an error).
+const outcome_done: u8 = 0;
+const outcome_refused: u8 = 1;
 
 /// A frame being written.
 pub const Wire = struct {
     buf: std.ArrayList(u8) = .empty,
+    /// Rank 0's outcome of its last checked primitive: the next frame carries it, a checked frame then starts afresh.
+    outcome: u8 = outcome_done,
 
     pub fn begin(w: *Wire, gpa: std.mem.Allocator, kind: Kind, step: u64) !void {
         w.buf.clearRetainingCapacity();
         try w.int(gpa, u8, @backingInt(kind));
         try w.int(gpa, u64, step);
+        try w.int(gpa, u8, w.outcome);
+        if (checked(kind)) w.outcome = outcome_done;
+    }
+
+    /// Rank 0's half of the primitive its last frame started was refused: the next frame says so.
+    pub fn refuse(w: *Wire) void {
+        w.outcome = outcome_refused;
     }
 
     pub fn int(w: *Wire, gpa: std.mem.Allocator, comptime T: type, v: T) !void {
@@ -95,6 +117,61 @@ pub const Reader = struct {
         for (out.items) |*x| x.* = try r.int(i32);
     }
 };
+
+/// A frame's header: its kind, its step, and rank 0's outcome of the checked primitive before it.
+pub const Header = struct { kind: Kind, step: u64, outcome: u8 };
+
+pub fn header(r: *Reader) !Header {
+    const kind: Kind = switch (try r.int(u8)) {
+        1 => .fill_begin,
+        2 => .fill_chunk,
+        3 => .verify,
+        4 => .pass,
+        5 => .snap_save,
+        6 => .snap_restore,
+        7 => .snap_drop,
+        8 => .fill_images,
+        9 => .done,
+        10 => .spill_sync,
+        11 => .spill_write,
+        12 => .spill_load,
+        13 => .spill_forget,
+        else => return error.BadFrame,
+    };
+    const step = try r.int(u64);
+    const outcome = try r.int(u8);
+    return .{ .kind = kind, .step = step, .outcome = outcome };
+}
+
+/// A follower's half of the outcome check: its own outcome of its last checked primitive, and that primitive's step.
+pub const Check = struct {
+    mine: u8 = outcome_done,
+    step: u64 = 0,
+
+    /// A frame arrives: why the pair broke when rank 0's byte differs from this rank's (checked kinds only), else null.
+    pub fn frame(c: *Check, buf: []u8, kind: Kind, step: u64, theirs: u8) ?[]const u8 {
+        if (!checked(kind)) return null;
+        const was = c.step;
+        const mine = c.mine;
+        c.mine = outcome_done; // the primitive this frame runs: done until its half refuses
+        c.step = step;
+        if (theirs == mine) return null;
+        return std.fmt.bufPrint(buf, "step {d}: rank 0 {s}, rank 1 {s}", .{ was, outcomeWord(theirs), outcomeWord(mine) }) catch "outcomes differ";
+    }
+
+    /// This rank's half of the primitive it runs was refused.
+    pub fn refuse(c: *Check) void {
+        c.mine = outcome_refused;
+    }
+};
+
+fn outcomeWord(o: u8) []const u8 {
+    return switch (o) {
+        outcome_done => "done",
+        outcome_refused => "refused",
+        else => "unknown",
+    };
+}
 
 /// A window of a round as both ranks build it: its stream's slot and extent, its first position, whether its rows'
 /// taps go into the drafter, its rows' ids.
@@ -338,6 +415,7 @@ pub const Lanes = struct {
     next_snap: u64 = 1,
     fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk
     spill: ?*spill_lanes.Tier = null, // kept states on this rank's disk too (the prompt cache's spill mode)
+    dog: ?*watchdog.Watchdog = null, // this rank's watchdog (null: off): busy in each primitive, ticked at each chunk
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -350,6 +428,8 @@ pub const Lanes = struct {
 
     /// Tells rank 1 to stop, then frees the host state (the model is the caller's).
     pub fn deinit(self: *Lanes) void {
+        if (self.dog) |d| d.stop();
+        self.dog = null;
         for (self.snaps.items) |sn| {
             if (sn.disk) |d| self.gpa.free(d.names);
             sn.buf.free();
@@ -420,8 +500,22 @@ pub const Lanes = struct {
 
     /// The frame being built goes to rank 1 (after `begin` and the fields), or to ranks 1-3 on the four-node split.
     pub fn flush(self: *Lanes) !void {
+        return self.deliver(true);
+    }
+
+    /// A frame that may be lost (snap_drop and done come at shutdown): a failed send is logged, not a broken pair.
+    fn flushLoose(self: *Lanes) !void {
+        return self.deliver(false);
+    }
+
+    fn deliver(self: *Lanes, breaks: bool) !void {
         if (self.peer == null) return;
-        for (self.m.followers()) |l| try l.?.send(self.wire.buf.items);
+        for (self.m.followers()) |l| {
+            l.?.send(self.wire.buf.items) catch |err| {
+                if (breaks) pairBroken(self.m, "a send to a follower failed");
+                return err;
+            };
+        }
     }
 
     pub fn begin(self: *Lanes, kind: Kind) !bool {
@@ -432,7 +526,19 @@ pub const Lanes = struct {
     }
 
     fn send(self: *Lanes, kind: Kind) !void {
-        if (try self.begin(kind)) try self.flush();
+        if (try self.begin(kind)) try self.flushLoose();
+    }
+
+    fn busy(self: *Lanes, name: []const u8) void {
+        if (self.dog) |d| d.busy(name);
+    }
+
+    fn tick(self: *Lanes) void {
+        if (self.dog) |d| d.tick();
+    }
+
+    fn idle(self: *Lanes) void {
+        if (self.dog) |d| d.idle();
     }
 
     // -- the vtable ---------------------------------------------------------------------------------------------
@@ -440,12 +546,14 @@ pub const Lanes = struct {
     /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
     /// the chunks the gates checked; the host's chunk plan is not followed), the head's draw of the first token.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
-        if (!try of(ptr).prefillPart(s, std.math.maxInt(usize))) return error.FillUnfinished;
+        const self = of(ptr);
+        if (!try stuck(self.m, "fill", self.prefillPart(s, std.math.maxInt(usize)))) return error.FillUnfinished;
     }
 
     /// The prompt pass in pieces of `chunks` chunks (opened at its first): true once it reached the head and drew the first token.
     fn prefillPartFn(ptr: *anyopaque, s: *lanes.Stream, chunks: usize) anyerror!bool {
-        return of(ptr).prefillPart(s, chunks);
+        const self = of(ptr);
+        return stuck(self.m, "fill", self.prefillPart(s, chunks));
     }
 
     fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
@@ -454,6 +562,8 @@ pub const Lanes = struct {
         defer if (self.prof) |*p| {
             p.prefill += m.now() - t0;
         };
+        self.busy("fill");
+        defer self.idle();
         if (self.fill) |f| {
             if (f.s != s) return error.FillBusy;
         } else try self.fillOpen(s);
@@ -471,6 +581,7 @@ pub const Lanes = struct {
             const start = f.start;
             const len = f.len;
             if (start > 0 and s.isCancelled()) return error.Cancelled;
+            self.tick();
             const n = @min(model.chunk_rows, len - start);
             if (try self.begin(.fill_chunk)) {
                 try self.wire.int(self.gpa, u64, start);
@@ -478,6 +589,7 @@ pub const Lanes = struct {
                 try self.wire.int(self.gpa, u64, f.replay);
                 try self.flush();
             }
+            errdefer self.wire.refuse();
             f.head = try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
             f.start += n;
             if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
@@ -566,6 +678,7 @@ pub const Lanes = struct {
             const row_bytes = m.cfg.hidden * 2;
             var at_row: usize = 0;
             for (s.images) |img| {
+                self.tick(); // (the tower takes a while on each picture)
                 if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
                 for (seq.items[img.at..][0..img.tokens]) |*q| {
                     if (q.* != @as(i64, image_id)) return error.BadImageSpan;
@@ -589,6 +702,7 @@ pub const Lanes = struct {
             try self.wire.ids(gpa, seq.items);
             try self.flush();
         }
+        errdefer self.wire.refuse(); // (every later frame's half too: each frame's begin starts the outcome afresh)
         try m.fillBegin(slot, base);
         if (spans.items.len > 0) {
             // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
@@ -660,12 +774,18 @@ pub const Lanes = struct {
         return self.drawn[handle % ring];
     }
 
-    /// Every window as one round at its stream's cache length: the pending token, the held drafts (or the host's), each
-    /// row drawn at its keyed position.
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const self = of(ptr);
+        return stuck(self.m, "verify", self.verifyRound(windows, out));
+    }
+
+    /// Every window as one round at its stream's cache length: the pending token, the held drafts (or the host's), each
+    /// row drawn at its keyed position.
+    fn verifyRound(self: *Lanes, windows: []const be.Window, out: []be.Verified) !void {
         const m = self.m;
         const gpa = self.gpa;
+        self.busy("verify");
+        defer self.idle();
         if (windows.len > max_streams) return error.WindowTooWide;
         var ids: [max_streams][max_rows]i32 = undefined;
         var wins: [max_streams]Win = undefined;
@@ -695,6 +815,7 @@ pub const Lanes = struct {
             }
             try self.flush();
         }
+        errdefer self.wire.refuse();
         const t1 = m.now();
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
         try m.verify(rows, self.built.absorb[0..windows.len], false); // roundArgmax / roundLogits wait next
@@ -739,11 +860,17 @@ pub const Lanes = struct {
         }
     }
 
-    /// One drafter pass for every stream asked: its pending token at its new length, `depth` drafts held.
     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const self = of(ptr);
+        return stuck(self.m, "pass", self.draftPass(requests));
+    }
+
+    /// One drafter pass for every stream asked: its pending token at its new length, `depth` drafts held.
+    fn draftPass(self: *Lanes, requests: []const be.DraftRequest) !void {
         const m = self.m;
         const gpa = self.gpa;
+        self.busy("pass");
+        defer self.idle();
         if (m.dr == null) return error.NoDraftHead;
         const block = m.dr.?.n;
         var tokens: [max_streams]i64 = undefined;
@@ -780,6 +907,7 @@ pub const Lanes = struct {
             }
             try self.flush();
         }
+        errdefer self.wire.refuse();
         const t0 = m.now();
         try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps);
         if (self.prof) |*p| {
@@ -884,9 +1012,13 @@ pub const Lanes = struct {
         return of(ptr).m.snapBytes();
     }
 
-    /// The live state at `at` (the pass stands at that chunk end): the slot's own part copied, the extent's rows kept.
     pub fn snapSaveFn(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
         const self = of(ptr);
+        return stuck(self.m, "snap_save", self.snapSave(owner, at)); // (inside a prompt pass: its window is the watchdog's)
+    }
+
+    /// The live state at `at` (the pass stands at that chunk end): the slot's own part copied, the extent's rows kept.
+    fn snapSave(self: *Lanes, owner: ?*anyopaque, at: u32) !*anyopaque {
         const s: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
         if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
@@ -901,6 +1033,7 @@ pub const Lanes = struct {
             try self.wire.int(self.gpa, u32, @intCast(l.slot));
             try self.flush();
         }
+        errdefer self.wire.refuse();
         try self.m.snapCopy(l.slot, sn.buf.ptr, true);
         return sn;
     }
@@ -916,7 +1049,7 @@ pub const Lanes = struct {
         _ = self.snaps.orderedRemove(i);
         if (self.begin(.snap_drop) catch false) {
             self.wire.int(self.gpa, u64, sn.id) catch {};
-            self.flush() catch |err| std.log.err("dsv41: rank 1 kept a dropped prompt state: {s}", .{@errorName(err)});
+            self.flushLoose() catch |err| std.log.err("dsv41: rank 1 kept a dropped prompt state: {s}", .{@errorName(err)});
         }
         if (sn.disk) |d| self.gpa.free(d.names);
         sn.buf.free();
@@ -944,17 +1077,72 @@ pub fn survivals(conf: []const f32, out: []f64) void {
     }
 }
 
+/// One JSON line `{"<key>": "<text>"}` with the text made safe for a JSON string (no quote, backslash or control byte).
+fn jsonLine(buf: []u8, key: []const u8, text: []const u8) []const u8 {
+    const tail: []const u8 = "\"}\n";
+    const head = std.fmt.bufPrint(buf, "{{\"{s}\": \"", .{key}) catch return "";
+    if (head.len + tail.len > buf.len) return "";
+    var n = head.len;
+    for (text) |c| {
+        if (n + 1 + tail.len > buf.len) break;
+        buf[n] = if (c == '"' or c == '\\' or c < ' ') '_' else c;
+        n += 1;
+    }
+    @memcpy(buf[n..][0..tail.len], tail);
+    return buf[0 .. n + tail.len];
+}
+
+/// This rank cannot trust its pair: abort its rings, say so, exit 75 (TF_DS_PAIR_BROKEN=log: only log it).
+pub fn pairBroken(m: *Model, why: []const u8) void {
+    var line: [256]u8 = undefined;
+    if (std.c.getenv("TF_DS_PAIR_BROKEN")) |v| if (std.mem.eql(u8, std.mem.span(v), "log")) {
+        std.debug.print("{s}", .{jsonLine(&line, "pair_would_break", why)});
+        return;
+    };
+    const text = jsonLine(&line, "pair_broken", why);
+    _ = std.c.write(2, text.ptr, text.len);
+    m.abortRings(why);
+    std.c._exit(75);
+}
+
+/// A CUDA failure is sticky (this rank fails every later primitive): from any primitive it breaks the pair.
+fn cudaFailed(m: *Model, err: anyerror, what: []const u8) void {
+    if (err != error.CudaFailed) return;
+    var buf: [64]u8 = undefined;
+    pairBroken(m, std.fmt.bufPrint(&buf, "{s}: CudaFailed on rank {d}", .{ what, m.rank }) catch "CudaFailed");
+}
+
+/// A primitive's result, passed on as it is; an error that is a CUDA failure first breaks the pair.
+fn stuck(m: *Model, what: []const u8, result: anytype) @TypeOf(result) {
+    if (result) |_| {} else |err| cudaFailed(m, err, what);
+    return result;
+}
+
+/// This rank's watchdog (null: TF_DS_WATCHDOG_S is 0), whose stall breaks the pair; stop it before the model closes.
+pub fn watch(gpa: std.mem.Allocator, io: std.Io, m: *Model) !?*watchdog.Watchdog {
+    const limit = try watchdog.limitFromEnv();
+    if (limit == 0) return null;
+    return try watchdog.Watchdog.start(gpa, io, limit, m, stalled);
+}
+
+fn stalled(ctx: *anyopaque, stall: watchdog.Stall) void {
+    var buf: [96]u8 = undefined;
+    pairBroken(@ptrCast(@alignCast(ctx)), std.fmt.bufPrint(&buf, "watchdog: {s} {d} s", .{ stall.name, stall.seconds }) catch "watchdog");
+}
+
 /// A primitive this rank refused: rank 0 runs the same one on the same inputs and refuses it at the same step (its
 /// request ends with the error), so the follower reports it and takes the next frame instead of ending.
-fn refused(err: anyerror) void {
+fn refused(m: *Model, check: *Check, kind: Kind, err: anyerror) void {
+    check.refuse();
     std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
+    cudaFailed(m, err, @tagName(kind));
 }
 
 /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
 pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 0 } = .{};
 
 /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
-pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier) !void {
+pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier, dog: ?*watchdog.Watchdog) !void {
     const peer = m.peer();
     const buf = try gpa.alloc(u8, (m.pool_cap + 1) * 4 + (1 << 16));
     defer gpa.free(buf);
@@ -964,6 +1152,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier) !void
     defer for (&win_ids) |*q| q.deinit(gpa);
     var built: Built = .{};
     var step: u64 = 0;
+    var check: Check = .{};
+    var why: [96]u8 = undefined;
     var slot: usize = 0;
     var img_rows: std.ArrayList(u8) = .empty; // a prompt's image rows as their pieces come
     defer img_rows.deinit(gpa);
@@ -974,27 +1164,17 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier) !void
         kept.deinit(gpa);
     }
     while (true) {
+        if (dog) |d| d.idle(); // waiting for the next frame is idle
         // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond
         // after this rank's GPU goes idle in a decode; a sleeping thread would add its core's wake-up to every frame)
         var r: Reader = .{ .b = try peer.recvSpin(buf, 20 * std.time.ns_per_ms) };
-        const kind: Kind = switch (try r.int(u8)) {
-            1 => .fill_begin,
-            2 => .fill_chunk,
-            3 => .verify,
-            4 => .pass,
-            5 => .snap_save,
-            6 => .snap_restore,
-            7 => .snap_drop,
-            8 => .fill_images,
-            9 => .done,
-            10 => .spill_sync,
-            11 => .spill_write,
-            12 => .spill_load,
-            13 => .spill_forget,
-            else => return error.BadFrame,
-        };
-        if (try r.int(u64) != step) return error.OutOfStep;
+        const h = try header(&r);
+        const kind = h.kind;
+        if (h.step != step) return error.OutOfStep;
+        // rank 0's outcome of the primitive before this one against this rank's: a pair that disagrees stops here
+        if (check.frame(&why, kind, step, h.outcome)) |text| pairBroken(m, text);
         step += 1;
+        if (dog) |d| if (kind != .done) d.busy(@tagName(kind));
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
         const spilling = @intFromEnum(kind) >= @intFromEnum(Kind.spill_sync); // in a pass like the snaps (rank 0 does not wait)
         if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images and !spilling) {
@@ -1008,7 +1188,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier) !void
                 if (slot >= max_streams) return error.BadSlot;
                 img_rows.clearRetainingCapacity();
                 try r.ids(gpa, &seqs[slot]);
-                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
+                m.fillBegin(slot, @intCast(base)) catch |err| refused(m, &check, kind, err);
                 m.fill_seq = seqs[slot].items;
             },
             .fill_chunk => {
@@ -1017,7 +1197,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier) !void
                 const replay: usize = @intCast(try r.int(u64));
                 if (start + n > seqs[slot].items.len) return error.BadChunk;
                 if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items; // a piece after a round: the read-ahead again
-                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
+                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(m, &check, kind, err);
             },
             .verify => {
                 const nw = try r.int(u32);
@@ -1033,7 +1213,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier) !void
                     wins[k] = .{ .slot = s, .base = base, .end = end, .start = start, .absorb = absorb, .ids = win_ids[k].items };
                 }
                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
-                m.verify(rows, built.absorb[0..nw], true) catch |err| refused(err);
+                m.verify(rows, built.absorb[0..nw], true) catch |err| refused(m, &check, kind, err);
                 if (m.prof) {
                     follow_prof.rounds += 1;
                     follow_prof.enqueue += m.t_enqueue;
@@ -1052,7 +1232,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier) !void
                     q0[i] = try r.int(i64);
                     slots[i] = try r.int(i64);
                 }
-                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(err);
+                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(m, &check, kind, err);
             },
             .fill_images => {
                 const count = try r.int(u32);
@@ -1071,7 +1251,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier) !void
                 if (off != img_rows.items.len or off + piece.len > total or piece.len == 0) return error.BadFrame;
                 try img_rows.appendSlice(gpa, piece);
                 if (img_rows.items.len == total) {
-                    m.setImages(spans.items, img_rows.items) catch |err| refused(err);
+                    m.setImages(spans.items, img_rows.items) catch |err| refused(m, &check, kind, err);
                     img_rows.clearRetainingCapacity();
                 }
             },
@@ -1082,7 +1262,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier) !void
                 var b = try cuda.DeviceBuffer.alloc(m.ctx.d, m.snapBytes());
                 m.snapCopy(s, b.ptr, true) catch |err| {
                     b.free();
-                    refused(err);
+                    refused(m, &check, kind, err);
                     continue;
                 };
                 try kept.put(gpa, id, b);
@@ -1095,8 +1275,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier) !void
                 const to: usize = @intCast(try r.int(u64));
                 const at: usize = @intCast(try r.int(u64));
                 const b = kept.get(id) orelse return error.UnknownSnapshot; // rank 0 restores only states both ranks keep
-                if (from != to) m.copyExtent(from, to, at) catch |err| refused(err);
-                m.snapCopy(s, b.ptr, false) catch |err| refused(err);
+                if (from != to) m.copyExtent(from, to, at) catch |err| refused(m, &check, kind, err);
+                m.snapCopy(s, b.ptr, false) catch |err| refused(m, &check, kind, err);
             },
             .snap_drop => {
                 const id = try r.int(u64);
@@ -1135,14 +1315,125 @@ test "a frame's fields read back as written" {
     try w.int(gpa, u64, 1 << 40);
     try w.ids(gpa, &.{ 1, -2, 129279 });
     var r: Reader = .{ .b = w.buf.items };
-    try std.testing.expectEqual(@as(u8, @backingInt(Kind.verify)), try r.int(u8));
-    try std.testing.expectEqual(@as(u64, 7), try r.int(u64));
+    const h = try header(&r);
+    try std.testing.expectEqual(Kind.verify, h.kind);
+    try std.testing.expectEqual(@as(u64, 7), h.step);
+    try std.testing.expectEqual(outcome_done, h.outcome);
     try std.testing.expectEqual(@as(u64, 1 << 40), try r.int(u64));
     var got: std.ArrayList(i32) = .empty;
     defer got.deinit(gpa);
     try r.ids(gpa, &got);
     try std.testing.expectEqualSlices(i32, &.{ 1, -2, 129279 }, got.items);
     try std.testing.expectError(error.ShortFrame, r.int(u8));
+    var odd: Reader = .{ .b = &.{ 99, 0, 0, 0, 0, 0, 0, 0, 0, 0 } };
+    try std.testing.expectError(error.BadFrame, header(&odd));
+}
+
+/// The outcome check through a fake wire: rank 0's frames as Wire writes them, read as follow reads them.
+const FakeWire = struct {
+    wire: Wire = .{},
+    check: Check = .{},
+    step: u64 = 0,
+    buf: [96]u8 = undefined,
+
+    /// One frame and the primitive it starts, each rank's half refused or not; why the pair broke at it, if it did.
+    fn frame(f: *FakeWire, kind: Kind, rank0_refuses: bool, rank1_refuses: bool) !?[]const u8 {
+        try f.wire.begin(std.testing.allocator, kind, f.step);
+        var r: Reader = .{ .b = f.wire.buf.items };
+        const h = try header(&r);
+        try std.testing.expectEqual(kind, h.kind);
+        try std.testing.expectEqual(f.step, h.step);
+        f.step += 1;
+        const broke = f.check.frame(&f.buf, h.kind, h.step, h.outcome);
+        if (checked(kind)) { // (the halves of an unchecked frame's primitive record nothing)
+            if (rank0_refuses) f.wire.refuse();
+            if (rank1_refuses) f.check.refuse();
+        }
+        return broke;
+    }
+
+    fn deinit(f: *FakeWire) void {
+        f.wire.deinit(std.testing.allocator);
+    }
+};
+
+test "outcomes that agree carry on: done and done, refused and refused, and a refusal is not carried past its frame" {
+    var f: FakeWire = .{};
+    defer f.deinit();
+    try std.testing.expect(try f.frame(.fill_begin, false, false) == null);
+    try std.testing.expect(try f.frame(.fill_chunk, true, true) == null); // both refuse it
+    try std.testing.expect(try f.frame(.verify, false, false) == null); // this frame carries that refusal: equal
+    try std.testing.expect(try f.frame(.verify, false, false) == null); // the next carries a done: nothing left over
+    try std.testing.expect(try f.frame(.pass, true, true) == null);
+    try std.testing.expect(try f.frame(.verify, true, true) == null); // two refusals in a row
+    try std.testing.expect(try f.frame(.verify, false, false) == null);
+    try std.testing.expect(try f.frame(.verify, false, false) == null);
+}
+
+test "rank 0 done and rank 1 refused breaks at the frame after the primitive, not at its own" {
+    var f: FakeWire = .{};
+    defer f.deinit();
+    try std.testing.expect(try f.frame(.verify, false, false) == null);
+    try std.testing.expect(try f.frame(.verify, false, true) == null); // the mixed primitive: its frame carries the one before
+    const why = (try f.frame(.verify, false, false)).?;
+    try std.testing.expectEqualStrings("step 1: rank 0 done, rank 1 refused", why);
+}
+
+test "rank 0 refused and rank 1 done breaks at the frame after the primitive, not at its own" {
+    var f: FakeWire = .{};
+    defer f.deinit();
+    try std.testing.expect(try f.frame(.fill_chunk, true, false) == null);
+    const why = (try f.frame(.fill_chunk, false, false)).?;
+    try std.testing.expectEqualStrings("step 0: rank 0 refused, rank 1 done", why);
+}
+
+test "a frame carries the outcome of the primitive before it, not its own" {
+    const gpa = std.testing.allocator;
+    var w: Wire = .{};
+    defer w.deinit(gpa);
+    var seen: [4]u8 = undefined;
+    for (&seen, 0..) |*o, i| {
+        try w.begin(gpa, .verify, @intCast(i));
+        var r: Reader = .{ .b = w.buf.items };
+        o.* = (try header(&r)).outcome;
+        if (i == 1) w.refuse(); // rank 0's half of the second primitive refused
+    }
+    try std.testing.expectEqualSlices(u8, &.{ outcome_done, outcome_done, outcome_refused, outcome_done }, &seen);
+}
+
+test "snap_drop, done and the spill frames neither compare nor consume an outcome" {
+    var f: FakeWire = .{};
+    defer f.deinit();
+    try std.testing.expect(try f.frame(.verify, false, true) == null); // a mixed primitive
+    for ([_]Kind{ .snap_drop, .spill_sync, .spill_write, .spill_load, .spill_forget, .done }) |k| {
+        try std.testing.expect(try f.frame(k, false, false) == null); // not here
+    }
+    try std.testing.expect(try f.frame(.pass, false, false) != null); // at the next checked frame
+    var g: FakeWire = .{};
+    defer g.deinit();
+    try std.testing.expect(try g.frame(.fill_chunk, true, true) == null); // a refusal both ranks made
+    for ([_]Kind{ .snap_drop, .spill_write }) |k| try std.testing.expect(try g.frame(k, false, false) == null);
+    try std.testing.expect(try g.frame(.verify, false, false) == null); // still pending over the unchecked frames: equal
+    try std.testing.expect(try g.frame(.verify, false, false) == null);
+}
+
+test "the outcome check covers the seven frames of the pair's device work and no other" {
+    for (std.enums.values(Kind)) |k| {
+        const want = switch (k) {
+            .fill_begin, .fill_chunk, .verify, .pass, .fill_images, .snap_save, .snap_restore => true,
+            else => false,
+        };
+        try std.testing.expectEqual(want, checked(k));
+    }
+}
+
+test "the pair_broken line is one JSON object, whatever the reason's text" {
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("{\"pair_broken\": \"step 3: rank 0 done, rank 1 refused\"}\n", jsonLine(&buf, "pair_broken", "step 3: rank 0 done, rank 1 refused"));
+    try std.testing.expectEqualStrings("{\"pair_broken\": \"a_b_c_d\"}\n", jsonLine(&buf, "pair_broken", "a\"b\\c\nd"));
+    var small: [24]u8 = undefined;
+    const cut = jsonLine(&small, "pair_broken", "a reason too long for the buffer");
+    try std.testing.expect(std.mem.endsWith(u8, cut, "\"}\n") and cut.len <= small.len);
 }
 
 test "a round's rows: each window at its positions, its ids written over the rejected rows" {

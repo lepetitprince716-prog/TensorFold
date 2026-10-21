@@ -171,9 +171,13 @@ pub fn main(init: std.process.Init) !u8 {
             try w.print("{{\"rank\": {d}, \"spill\": \"{s}\", \"states\": {d}}}\n", .{ o.rank, dir, tier.?.sp.states.count() });
             try w.flush();
         }
-        dsv41.lanes.follow(gpa, m, tier) catch |err| {
-            try w.print("{{\"rank\": {d}, \"follow\": \"{s}\"}}\n", .{ o.rank, @errorName(err) });
-            try w.flush();
+        const dog = try dsv41.lanes.watch(gpa, io, m);
+        defer if (dog) |d| d.stop();
+        dsv41.lanes.follow(gpa, m, tier, dog) catch |err| {
+            w.print("{{\"rank\": {d}, \"follow\": \"{s}\"}}\n", .{ o.rank, @errorName(err) }) catch {};
+            w.flush() catch {};
+            var why: [64]u8 = undefined;
+            dsv41.lanes.pairBroken(m, std.fmt.bufPrint(&why, "follow: {s}", .{@errorName(err)}) catch "follow"); // exits 75
             return 1;
         };
         try w.print("{{\"rank\": {d}, \"followed\": true}}\n", .{o.rank});
@@ -187,6 +191,7 @@ pub fn main(init: std.process.Init) !u8 {
     const reqs = (try std.json.parseFromSliceLeaky(Requests, a, text, .{ .ignore_unknown_fields = true })).requests;
     var ln = dsv41.lanes.Lanes.init(gpa, m);
     defer ln.deinit();
+    ln.dog = try dsv41.lanes.watch(gpa, io, m); // (deinit stops it)
     ln.fix_k = fix_k;
     if (profile) {
         ln.prof = .{};

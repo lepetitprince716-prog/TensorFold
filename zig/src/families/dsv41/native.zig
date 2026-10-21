@@ -179,6 +179,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const L = lanes_mod.Lanes;
     var snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
     if (st.tier) |t| snaps.spill = .{ .write = spill_lanes.writeFn, .read = spill_lanes.readFn, .forget = spill_lanes.forgetFn, .disk_bytes = spill_lanes.diskBytesFn, .known = spill_lanes.knownFn, .root = t.settings.root, .cap = t.settings.cap, .min_tokens = t.settings.min_tokens, .identity = t.identity };
+    st.lanes.dog = try lanes_mod.watch(gpa, io, st.m); // last: nothing after it can fail with the thread running
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
 }
 
@@ -209,6 +210,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.BadSpillGib, error.BadSpillMin, error.BadSpillStaging => "TF_DS_SPILL_GIB, TF_DS_SPILL_MIN_TOKENS and TF_DS_SPILL_STAGING_MIB take numbers",
         error.SamplingNotSupported => sampling_words,
+        error.BadWatchdog => "TF_DS_WATCHDOG_S takes whole seconds (default 120; 0 turns the watchdog off)",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
         else => null,
     };
@@ -218,5 +220,6 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
     try std.testing.expectEqualStrings("top_k must be 1-56 when sampling", explain(null, error.SamplingNotSupported).?);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadWatchdog).?, "TF_DS_WATCHDOG_S") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }

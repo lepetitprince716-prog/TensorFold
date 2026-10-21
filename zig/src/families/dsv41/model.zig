@@ -436,6 +436,12 @@ pub const Model = struct {
         return m.fan.links[0 .. m.world - 1];
     }
 
+    /// Every wait on this rank's RDMA rings gives up (the pair broke): a collect kernel spinning on the peer ends.
+    pub fn abortRings(m: *Model, why: []const u8) void {
+        if (m.ring) |r| r.abort(why);
+        if (m.rdma_rings) |*rs| for ([_]*rdma.Ring{ rs.all4, rs.col, rs.pair }) |r| r.abort(why);
+    }
+
     pub fn drafting(m: *const Model) bool {
         return m.dr != null;
     }
