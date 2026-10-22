@@ -312,3 +312,91 @@ test "the cap counts queued writes; a failed one is noted and never listed; dein
     defer again.deinit();
     try std.testing.expect(again.has(Imprint.keyOf(c3[0..5])) and again.has(Imprint.keyOf(c4[0..5])));
 }
+
+/// A family whose spill writes fail when the test says so, at once (the synchronous path: `write` returns the error).
+const Fails = struct {
+    var fail: bool = false;
+    var write: *const fn (*anyopaque, pc.Saved, [:0]const u8, u64, []const u32) anyerror!void = undefined;
+
+    fn vtable(f: *Fake) pc.Snapshots.VTable {
+        fail = false;
+        var vt = f.learned().vtable.*;
+        write = vt.write.?;
+        vt.write = writeFn;
+        return vt;
+    }
+    fn writeFn(ptr: *anyopaque, saved: pc.Saved, dir: [:0]const u8, key: u64, tokens: []const u32) anyerror!void {
+        if (fail) return error.SpillWrite;
+        try write(ptr, saved, dir, key, tokens);
+    }
+};
+
+test "a failed rewrite of a state the index lists is said as the synchronous path says it; a good one says nothing" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [128]u8 = undefined;
+    const ca = [_]u32{ 1, 2, 3, 4, 5, 9, 9 };
+    const key = Imprint.keyOf(ca[0..5]);
+    var said: [200]u8 = undefined;
+    var said_len: usize = 0;
+    {
+        const root = try scratch(&buf, "rewrite-sync"); // the write returns its error at once
+        defer rmTree(root);
+        var im = try Imprint.open(gpa, root, 4, 1 << 30);
+        defer im.deinit();
+        var f: Fake = .{ .gpa = gpa };
+        const vt = Fails.vtable(&f);
+        var s = Store.init(gpa, .{ .ptr = &f, .vtable = &vt }, rules, 1 << 20);
+        defer s.deinit();
+        s.imprint = &im;
+        s.spill = true;
+        _ = f.pass(&s, &ca, try s.begin(a, &ca, 5, &.{}, &.{}, null));
+        try std.testing.expect(im.has(key));
+        s.forget(&ca, 5); // out of memory, still listed
+        f.at = 5;
+        Fails.fail = true;
+        pc.said = .{};
+        try std.testing.expect(s.keep(&ca, 5, null, &.{})); // kept again: the known state's write fails
+        try std.testing.expectEqual(@as(usize, 1), pc.said.count);
+        said_len = pc.said.last().len;
+        @memcpy(said[0..said_len], pc.said.last());
+    }
+    const root = try scratch(&buf, "rewrite-queued"); // the write is queued and fails later
+    defer rmTree(root);
+    var im = try Imprint.open(gpa, root, 4, 1 << 30);
+    defer im.deinit();
+    var f: Fake = .{ .gpa = gpa };
+    const vt = Later.vtable(&f);
+    var s = Store.init(gpa, .{ .ptr = &f, .vtable = &vt }, rules, 1 << 20);
+    defer s.deinit();
+    s.imprint = &im;
+    s.spill = true;
+    _ = f.pass(&s, &ca, try s.begin(a, &ca, 5, &.{}, &.{}, null));
+    Later.it.done = 1;
+    s.settle(false);
+    try std.testing.expect(im.has(key) and s.pending.items.len == 0);
+    s.forget(&ca, 5);
+    f.at = 5;
+    pc.said = .{};
+    try std.testing.expect(s.keep(&ca, 5, null, &.{})); // the rewrite is queued
+    try std.testing.expectEqual(@as(usize, 1), s.pending.items.len); // watched
+    try std.testing.expectEqual(@as(u64, 0), s.pending.items[0].bytes); // and adds nothing to the cap: the index counts it
+    Later.it.fail_key = key;
+    Later.it.done = 2;
+    s.settle(false);
+    try std.testing.expectEqual(@as(usize, 0), s.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 1), pc.said.count);
+    try std.testing.expectEqualStrings(said[0..said_len], pc.said.last()); // the same line as the synchronous path's
+    try std.testing.expectEqualStrings("prompt cache: learning 5 tokens failed (SpillWrite)", pc.said.last());
+    try std.testing.expect(im.has(key) and im.metas.items.len == 1);
+    Later.it.fail_key = null; // a rewrite that lands says nothing and lists nothing twice
+    s.forget(&ca, 5);
+    f.at = 5;
+    try std.testing.expect(s.keep(&ca, 5, null, &.{}));
+    Later.it.done = 3;
+    s.settle(false);
+    try std.testing.expectEqual(@as(usize, 1), pc.said.count);
+    try std.testing.expect(s.pending.items.len == 0 and im.metas.items.len == 1);
+}

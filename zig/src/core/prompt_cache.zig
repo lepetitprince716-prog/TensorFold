@@ -96,7 +96,7 @@ pub const Store = struct {
     const SHARED_KEYS = 64;
 
     /// A queued spill write's index record, made when it is queued (the entry and its tokens may be gone when it ends).
-    const Pending = struct { key: u64, at: u32, n: u32, check: u64, starts: []u32, bytes: u64 };
+    const Pending = struct { key: u64, at: u32, n: u32, check: u64, starts: []const u32, bytes: u64, known: bool = false };
 
     pub fn init(gpa: Allocator, family: Snapshots, rules: Rules, budget: u64) Store {
         return .{ .gpa = gpa, .family = family, .rules = rules, .budget = budget };
@@ -340,7 +340,10 @@ pub const Store = struct {
         if (queued and s.pendingOf(key) != null) return; // its write is under way
         if (!known) while (!im.fits(bytes + s.pendingBytes())) s.unlearn(im, im.victim() orelse return); // least recently used first
         write(s.family.ptr, e.saved, im.dir, key, e.tokens) catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
-        if (known) return im.touch(key); // already on disk: the family noted it for this kept state
+        if (known) {
+            if (queued) s.watch(key, e); // a rewrite that fails is said when it ends, as the synchronous one is said at once
+            return im.touch(key); // already on disk: the family noted it for this kept state
+        }
         if (queued) return s.queue(key, e, starts, bytes);
         const added = if (s.spill) im.addHashed(key, e.at, e.tokens, starts, bytes) else im.add(key, e.at, e.tokens, starts, bytes);
         added catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
@@ -355,6 +358,11 @@ pub const Store = struct {
             s.gpa.free(st);
             note("learning {d} tokens failed ({s})", .{ e.at, "OutOfMemory" });
         };
+    }
+
+    /// A known state's queued rewrite: the index lists it already, so only its failure matters when it ends.
+    fn watch(s: *Store, key: u64, e: *const Entry) void {
+        s.pending.append(s.gpa, .{ .key = key, .at = e.at, .n = 0, .check = 0, .starts = &.{}, .bytes = 0, .known = true }) catch {}; // (no room: a failure goes unsaid)
     }
 
     fn pendingOf(s: *const Store, key: u64) ?usize {
@@ -382,9 +390,10 @@ pub const Store = struct {
     }
 
     fn listed(s: *Store, key: u64, failure: ?anyerror) void {
-        const p = s.pending.orderedRemove(s.pendingOf(key) orelse return); // (none: a known state's rewrite)
+        const p = s.pending.orderedRemove(s.pendingOf(key) orelse return); // (none: its record did not fit)
         defer s.gpa.free(p.starts);
         if (failure) |err| return note("learning {d} tokens failed ({s})", .{ p.at, @errorName(err) });
+        if (p.known) return; // the index lists it already
         const im = s.imprint orelse return;
         im.addSummed(p.key, p.at, p.n, p.check, p.starts, p.bytes) catch |err| return note("learning {d} tokens failed ({s})", .{ p.at, @errorName(err) });
         if (!@import("builtin").is_test) std.log.info("prompt cache: learned {d} tokens to disk", .{p.at});
@@ -486,9 +495,25 @@ pub const Store = struct {
     }
 };
 
-/// A line on the engine's log; tests stay quiet (the build runner fails a test that writes to stderr).
+/// Under test: the lines `note` has said (how many, and the last in full), as the log would show them.
+pub const Said = struct {
+    count: usize = 0,
+    buf: [200]u8 = undefined,
+    len: usize = 0,
+
+    pub fn last(x: *const Said) []const u8 {
+        return x.buf[0..x.len];
+    }
+};
+pub var said: Said = .{};
+
+/// A line on the engine's log; tests keep it in `said` instead (the build runner fails a test that writes to stderr).
 fn note(comptime fmt: []const u8, args: anytype) void {
-    if (@import("builtin").is_test) return;
+    if (@import("builtin").is_test) {
+        said.count += 1;
+        said.len = if (std.fmt.bufPrint(&said.buf, "prompt cache: " ++ fmt, args)) |out| out.len else |_| said.buf.len;
+        return;
+    }
     std.log.warn("prompt cache: " ++ fmt, args);
 }
 
