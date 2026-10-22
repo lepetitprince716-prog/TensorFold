@@ -293,16 +293,25 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
     }
 
-    /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
+    /// Prefills the next queued request (while a pass fills, the first that core.cutsIn); false if none or no lane.
     fn admitOne(h: *LaneHost) bool {
         h.lock();
-        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes or h.filling != null) {
+        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
             h.unlock();
             return false;
         }
+        var at: usize = 0;
+        if (h.filling != null) {
+            at = for (h.queued.items, 0..) |j, i| {
+                if (h.core.cutsIn(j.request.prompt.len, j.request.images.len > 0)) break i;
+            } else {
+                h.unlock();
+                return false;
+            };
+        }
         if (h.full_wait) |n| {
             const active = h.core.activeCount();
-            if (active > 0 and active >= n and std.Io.Clock.awake.now(h.io).toNanoseconds() < h.full_retry) {
+            if ((active > 0 or h.filling != null) and active >= n and std.Io.Clock.awake.now(h.io).toNanoseconds() < h.full_retry) {
                 h.unlock();
                 return false;
             }
@@ -315,7 +324,7 @@ pub const LaneHost = struct {
             }
             h.finish_until = null;
         }
-        const job = h.queued.orderedRemove(0);
+        const job = h.queued.orderedRemove(at);
         h.admitted.append(h.gpa, job) catch {
             h.unlock();
             h.finish(job, .failed, "out of memory");
@@ -359,7 +368,8 @@ pub const LaneHost = struct {
         if (h.loneFits(job)) return h.runLone(job, began);
         h.core.addStream(&job.stream) catch |e| {
             if (e == error.Cancelled) return h.cancel(job);
-            if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
+            // a pass in pieces holds room as the active streams do: a cut-in refused for room waits, as it would without cut_in
+            if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) return h.requeue(job);
             return h.drop(job, h.words(e));
         };
         if (h.core.filling == &job.stream) {

@@ -41,12 +41,12 @@ pub const image_piece = 32 << 10;
 pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, outcome u8, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, spill_sync = 10, spill_write = 11, spill_load = 12, spill_forget = 13, spill_wait = 14 };
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, spill_sync = 10, spill_write = 11, spill_load = 12, spill_forget = 13, spill_wait = 14, fill_resume = 15 };
 
 /// Whether the ranks compare outcomes at this frame: the pair's device work, not snap_drop, done or a spill frame.
 pub fn checked(kind: Kind) bool {
     return switch (kind) {
-        .fill_begin, .fill_chunk, .verify, .pass, .fill_images, .snap_save, .snap_restore => true,
+        .fill_begin, .fill_chunk, .verify, .pass, .fill_images, .snap_save, .snap_restore, .fill_resume => true,
         .snap_drop, .done, .spill_sync, .spill_write, .spill_load, .spill_forget, .spill_wait => false,
     };
 }
@@ -138,6 +138,7 @@ pub fn header(r: *Reader) !Header {
         12 => .spill_load,
         13 => .spill_forget,
         14 => .spill_wait,
+        15 => .fill_resume,
         else => return error.BadFrame,
     };
     const step = try r.int(u64);
@@ -524,6 +525,7 @@ pub const Lanes = struct {
     fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk
     spill: ?*spill_lanes.Tier = null, // kept states on this rank's disk too (the prompt cache's spill mode)
     dog: ?*watchdog.Watchdog = null, // this rank's watchdog (null: off): busy in each primitive, ticked at each chunk
+    paused: ?Fill = null, // the pass a short prompt cut into (lanes' cut_in), resumed by its next piece
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -687,9 +689,15 @@ pub const Lanes = struct {
         };
         self.busy("fill");
         defer self.idle();
-        if (self.fill) |f| {
-            if (f.s != s) return error.FillBusy;
-        } else try self.fillOpen(s);
+        if (self.fill) |f| if (f.s != s) {
+            // a prompt cuts in between this pass's pieces: it waits (one at most, no images), its next piece resumes it
+            if (self.paused != null or f.s.images.len > 0 or s.images.len > 0) return error.FillBusy;
+            self.paused = f;
+            self.fill = null;
+        };
+        if (self.fill == null) {
+            if (self.paused != null and self.paused.?.s == s) try self.fillResume() else try self.fillOpen(s);
+        }
         errdefer self.fill = null;
         const f = &self.fill.?;
         const seq = self.seqs[f.slot].items;
@@ -731,6 +739,20 @@ pub const Lanes = struct {
         const token = try draw(logits, done.len, s.sampling);
         self.streams.getPtr(s).?.first = self.take(token);
         return true;
+    }
+
+    /// A paused pass resumes: both ranks' model views back on its slot and extent, whose rows, rings and ids it kept.
+    fn fillResume(self: *Lanes) !void {
+        const f = self.paused.?;
+        const l = self.streams.get(f.s) orelse return error.UnknownStream;
+        if (try self.begin(.fill_resume)) {
+            try self.wire.int(self.gpa, u32, @intCast(f.slot));
+            try self.wire.int(self.gpa, u64, l.base);
+            try self.flush();
+        }
+        try self.m.fillBegin(f.slot, l.base);
+        self.fill = f;
+        self.paused = null;
     }
 
     /// A prompt pass's start: its slot and extent, its images, rank 1's fill and the kept state it resumes from.
@@ -1201,6 +1223,9 @@ pub const Lanes = struct {
             self.m.fill_seq = &.{};
             self.fill = null;
         };
+        if (self.paused) |f| if (f.s == s) {
+            self.paused = null;
+        };
         const kv = self.streams.fetchRemove(s) orelse return;
         self.used[kv.value.slot] = false;
     }
@@ -1346,7 +1371,10 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier, dog: 
         step += 1;
         if (dog) |d| if (kind != .done) d.busy(@tagName(kind));
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
-        const spilling = @intFromEnum(kind) >= @intFromEnum(Kind.spill_sync); // in a pass like the snaps (rank 0 does not wait)
+        const spilling = switch (kind) {
+            .spill_sync, .spill_write, .spill_load, .spill_forget, .spill_wait => true,
+            else => false,
+        }; // in a pass like the snaps (rank 0 does not wait)
         if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images and !spilling) {
             m.joinAhead();
             m.fill_seq = &.{};
@@ -1358,6 +1386,13 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier, dog: 
                 if (slot >= max_streams) return error.BadSlot;
                 img_rows.clearRetainingCapacity();
                 try r.ids(gpa, &seqs[slot]);
+                m.fillBegin(slot, @intCast(base)) catch |err| refused(m, &check, kind, err);
+                m.fill_seq = seqs[slot].items;
+            },
+            .fill_resume => {
+                slot = try r.int(u32);
+                const base = try r.int(u64);
+                if (slot >= max_streams) return error.BadSlot;
                 m.fillBegin(slot, @intCast(base)) catch |err| refused(m, &check, kind, err);
                 m.fill_seq = seqs[slot].items;
             },
