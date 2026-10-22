@@ -304,3 +304,45 @@ test "stop runs the queued jobs before the thread ends" {
     try writer.landed(&rig.sp, j);
     try std.testing.expect(rig.sp.check(3, 32, nm));
 }
+
+test "the queue holds max_queue writes; one more is refused until the oldest ran; a stuck writer leaves a wait to time out" {
+    const gpa = std.testing.allocator;
+    var d1: [128]u8 = undefined;
+    const dir = try st.scratch(&d1, "bound");
+    defer st.rmDir(dir);
+    const mem = try gpa.alloc(u8, 16384);
+    defer gpa.free(mem);
+    var b = try Bench.init(gpa, mem, dir, 2);
+    defer b.deinit(gpa);
+    b.rig.f.scramble(71);
+    try std.testing.expectEqual(@as(usize, 8), writer.max_queue);
+    var doors: [writer.max_queue + 1]Door = @splat(.{});
+    defer for (&doors) |*d| d.open.store(true, .release); // (a failed check must not leave the writer on a closed gate)
+    var jobs: [writer.max_queue + 1]*writer.Job = undefined;
+    for (&jobs, 0..) |*j, i| { // each a block of its own
+        var tokens: [16]u32 = undefined;
+        for (&tokens, 0..) |*x, k| x.* = @intCast(1000 * (i + 1) + k);
+        const nm = try spill.names(gpa, &tokens, 16, 16);
+        defer gpa.free(nm);
+        j.* = try writer.plan(&b.rig.sp, i, 200 + i, 16, nm, 0, Fake.slots);
+        j.*.gate = doors[i].gate();
+    }
+    for (jobs[0 .. writer.max_queue - 1]) |j| try b.w.push(j);
+    try std.testing.expect(!b.w.full()); // one short of the bound
+    try b.w.push(jobs[writer.max_queue - 1]);
+    try std.testing.expect(b.w.full());
+    try std.testing.expectEqual(@as(u64, writer.max_queue), b.w.queued());
+    try std.testing.expectError(error.SpillQueueFull, b.w.push(jobs[writer.max_queue])); // the ninth waits for room
+    try std.testing.expectEqual(@as(u64, writer.max_queue), b.w.queued()); // and left nothing queued
+    try std.testing.expect(!b.w.wait(jobs[0], 30 * std.time.ns_per_ms)); // the writer is stuck on the first gate: the limit passes
+    try std.testing.expect(b.w.full());
+    doors[0].open.store(true, .release); // the oldest runs (the next gate holds the writer again)
+    try std.testing.expect(b.w.wait(jobs[0], 10 * std.time.ns_per_s));
+    try std.testing.expect(!b.w.full());
+    try b.w.push(jobs[writer.max_queue]);
+    try std.testing.expect(b.w.full());
+    for (&doors) |*d| d.open.store(true, .release);
+    for (jobs) |j| try b.settle(gpa, j);
+    try std.testing.expectEqual(@as(u64, 0), b.w.queued());
+    for (0..jobs.len) |i| try std.testing.expect(b.rig.sp.has(200 + i));
+}

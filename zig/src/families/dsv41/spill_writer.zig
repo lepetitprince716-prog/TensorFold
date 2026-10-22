@@ -23,6 +23,9 @@ pub const Hook = struct {
     run: *const fn (ctx: *anyopaque) void,
 };
 
+/// Writes queued or running at most: past it the engine thread waits for the oldest to run before it queues another.
+pub const max_queue = 8;
+
 /// One queued write: a kept state's names (reserved on the tier at its plan), the blocks it writes, its sources.
 pub const Job = struct {
     seq: u64 = 0,
@@ -134,8 +137,19 @@ pub const Writer = struct {
         w.gpa.destroy(w);
     }
 
-    /// Queues `j` (the engine thread): its seq is the next one.
+    /// The engine thread's: the writes pushed and not yet run (the one running included).
+    pub fn queued(w: *const Writer) u64 {
+        return w.pushed -| w.done.load(.acquire);
+    }
+
+    /// The engine thread's: whether `max_queue` writes are queued or running (the next push is refused until one ran).
+    pub fn full(w: *const Writer) bool {
+        return w.queued() >= max_queue;
+    }
+
+    /// Queues `j` (the engine thread): its seq is the next one; refused while the queue is full (wait for room first).
     pub fn push(w: *Writer, j: *Job) !void {
+        if (w.full()) return error.SpillQueueFull;
         j.seq = w.pushed + 1;
         w.acquire();
         defer w.release();

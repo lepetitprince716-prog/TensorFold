@@ -162,6 +162,15 @@ fn waitFor(t: *Tier, j: *writer.Job, why: []const u8) void {
     std.log.info("dsv41: the engine thread waited {d} ms for the spill write of {d} tokens ({s})", .{ (b.m.now() - t0) / std.time.ns_per_ms, j.at, why });
 }
 
+/// Room for one more write: the finished ones ended, and with the writer's queue full the oldest write ends first.
+fn makeRoom(t: *Tier, ln: ?*Lanes) void {
+    const b = t.bg.?;
+    reap(t, ln);
+    if (!b.w.full() or b.jobs.items.len == 0) return;
+    waitFor(t, b.jobs.items[0], "the writer's queue is full");
+    reap(t, ln);
+}
+
 /// Every queued write ended on the tier.
 pub fn drain(t: *Tier, ln: ?*Lanes) void {
     const b = t.bg orelse return;
@@ -236,6 +245,7 @@ pub fn queue(ln: *Lanes, t: *Tier, b: *Background, sn: *Snap, dir: [:0]const u8,
         b.fails.appendAssumeCapacity(null);
         return;
     }
+    makeRoom(t, ln); // (a full queue waits here, in the prompt pass's watchdog window, where the synchronous write ran)
     try b.jobs.ensureUnusedCapacity(ln.gpa, 1);
     const j = try writer.plan(&t.sp, sn.id, key, sn.at, nm, sn.base, sn.buf.ptr);
     errdefer {
@@ -262,6 +272,7 @@ pub fn followWrite(m: *model.Model, t: *Tier, id: u64, key: u64, at: usize, nm: 
     const b = t.bg.?;
     reap(t, null);
     if (t.sp.check(key, at, nm)) return; // on disk already
+    makeRoom(t, null); // (a full queue waits here, in this frame's watchdog window, where the synchronous write ran)
     queueHere(m, t, b, id, key, at, nm, base, src) catch |err| std.log.err("dsv41: spilling {d} tokens failed: {s}", .{ at, @errorName(err) });
 }
 
