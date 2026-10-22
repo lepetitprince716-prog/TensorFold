@@ -244,7 +244,7 @@ test "a failed write gives its names back, lists nothing, and a later write that
     try std.testing.expectEqual(@as(u32, 0), b.rig.sp.refs.count()); // every reservation given back
 }
 
-test "a write past the free floor fails before any file" {
+test "a write past the free floor fails before any file; the next one writes the blocks it skipped for it" {
     const gpa = std.testing.allocator;
     var d1: [128]u8 = undefined;
     const dir = try st.scratch(&d1, "full");
@@ -254,17 +254,28 @@ test "a write past the free floor fails before any file" {
     var b = try Bench.init(gpa, mem, dir, 2);
     defer b.deinit(gpa);
     b.rig.f.scramble(51);
-    var tokens: [32]u32 = undefined;
+    var tokens: [48]u32 = undefined;
     for (&tokens, 0..) |*x, i| x.* = @intCast(i);
-    const nm = try spill.names(gpa, &tokens, 32, 16);
-    defer gpa.free(nm);
+    const short = try spill.names(gpa, &tokens, 32, 16);
+    defer gpa.free(short);
+    const long = try spill.names(gpa, &tokens, 48, 16);
+    defer gpa.free(long);
+    const j1 = try writer.plan(&b.rig.sp, 1, 1, 32, short, 0, Fake.slots);
+    const j2 = try writer.plan(&b.rig.sp, 2, 2, 48, long, 0, Fake.slots); // block 2 only: j1 holds 0 and 1
+    try std.testing.expectEqual(@as(usize, 1), j2.todo.len);
+    const floor = b.rig.sp.floor;
     b.rig.sp.floor = std.math.maxInt(u64) / 2; // more than any disk has free (off Linux: than the unbounded figure)
-    const j = try writer.plan(&b.rig.sp, 1, 1, 32, nm, 0, Fake.slots);
-    try b.w.push(j);
-    try std.testing.expect(b.w.wait(j, 10 * std.time.ns_per_s));
-    try std.testing.expectError(error.SpillDiskFull, j.result);
-    try b.settle(gpa, j);
+    try b.w.push(j1);
+    try std.testing.expect(b.w.wait(j1, 10 * std.time.ns_per_s));
+    try std.testing.expectError(error.SpillDiskFull, j1.result);
     try std.testing.expectEqual(@as(usize, 0), st.count(dir, ".blk"));
+    try b.settle(gpa, j1);
+    b.rig.sp.floor = floor;
+    try b.w.push(j2);
+    try b.settle(gpa, j2);
+    try std.testing.expect(b.rig.sp.check(2, 48, long));
+    try std.testing.expectEqual(@as(usize, 3), st.count(dir, ".blk"));
+    b.rig.sp.forget(2);
     try std.testing.expectEqual(@as(u32, 0), b.rig.sp.refs.count());
 }
 

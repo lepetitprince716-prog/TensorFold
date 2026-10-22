@@ -200,7 +200,6 @@ pub const Writer = struct {
     /// The job's blocks (and those of its names a failed job before it left unwritten), its slot file, its directory.
     fn write(w: *Writer, j: *Job) !void {
         const sp = w.sp;
-        if (spill.freeBytes(j.dir) < sp.diskBytes(j.at) + sp.floor) return error.SpillDiskFull;
         var todo: std.ArrayList(usize) = .empty;
         defer todo.deinit(w.gpa);
         var next: usize = 0;
@@ -212,6 +211,7 @@ pub const Writer = struct {
         try w.missing.ensureUnusedCapacity(w.gpa, @intCast(todo.items.len));
         for (todo.items) |k| w.missing.putAssumeCapacity(j.names[k], {}); // until written: a later job that names it writes it
         try j.wrote.ensureTotalCapacity(w.gpa, todo.items.len);
+        if (spill.freeBytes(j.dir) < sp.diskBytes(j.at) + sp.floor) return error.SpillDiskFull;
         if (j.gate) |g| try g.wait(g.ctx);
         const per = sp.blockFile();
         const fit = w.stage.len / per;
