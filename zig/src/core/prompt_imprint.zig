@@ -138,14 +138,24 @@ pub const Imprint = struct {
         return m.addAs(true, key, at, tokens, starts, bytes);
     }
 
+    /// addHashed with the tokens' count and checkOf taken earlier (a spill write that finished after its tokens went).
+    pub fn addSummed(m: *Imprint, key: u64, at: u32, n: u32, check: u64, starts: []const u32, bytes: u64) !void {
+        if (m.has(key)) return;
+        return m.addMeta(key, at, &.{}, n, check, starts, bytes);
+    }
+
     fn addAs(m: *Imprint, hashed_: bool, key: u64, at: u32, tokens: []const u32, starts: []const u32, bytes: u64) !void {
         if (m.has(key)) return;
+        return m.addMeta(key, at, if (hashed_) &.{} else tokens, @intCast(tokens.len), if (hashed_) checkOf(tokens) else 0, starts, bytes);
+    }
+
+    fn addMeta(m: *Imprint, key: u64, at: u32, tokens: []const u32, n: u32, check: u64, starts: []const u32, bytes: u64) !void {
         const below = cut(starts, at);
-        const t = try m.gpa.dupe(u32, if (hashed_) &.{} else tokens);
+        const t = try m.gpa.dupe(u32, tokens);
         errdefer m.gpa.free(t);
         const s = try m.gpa.dupe(u32, below);
         errdefer m.gpa.free(s);
-        const x: Meta = .{ .key = key, .at = at, .tokens = t, .starts = s, .bytes = bytes, .n = @intCast(tokens.len), .check = if (hashed_) checkOf(tokens) else 0 };
+        const x: Meta = .{ .key = key, .at = at, .tokens = t, .starts = s, .bytes = bytes, .n = n, .check = check };
         var path: [1100]u8 = undefined;
         const fd = std.c.open(try std.fmt.bufPrintSentinel(&path, "{s}/index", .{m.dir}, 0), .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }, @as(std.c.mode_t, 0o600));
         if (fd < 0) return error.ImprintWrite;

@@ -5,16 +5,16 @@ const Spill = spill.Spill;
 const Name = spill.Name;
 
 /// A device of host bytes: address x is mem[x - origin]; three planes over a pool of `cap` positions and slot parts.
-const Fake = struct {
+pub const Fake = struct {
     mem: []u8,
     copies: usize = 0,
-    const origin: u64 = 1 << 32;
+    pub const origin: u64 = 1 << 32;
     const cap = 64; // pool positions
-    const planes = [_]spill.Plane{ .{ .addr = origin, .ratio = 4, .row = 32 }, .{ .addr = origin + 1024, .ratio = 4, .row = 8 }, .{ .addr = origin + 2048, .ratio = 16, .row = 64 } };
-    const slots: u64 = origin + 4096; // two slot parts of 5000 bytes
-    const slot_bytes = 5000;
+    pub const planes = [_]spill.Plane{ .{ .addr = origin, .ratio = 4, .row = 32 }, .{ .addr = origin + 1024, .ratio = 4, .row = 8 }, .{ .addr = origin + 2048, .ratio = 16, .row = 64 } };
+    pub const slots: u64 = origin + 4096; // two slot parts of 5000 bytes
+    pub const slot_bytes = 5000;
 
-    fn dev(f: *Fake) spill.Dev {
+    pub fn dev(f: *Fake) spill.Dev {
         return .{ .ctx = f, .to_host = toHost, .to_device = toDevice, .wait = wait };
     }
     fn of(ctx: *anyopaque) *Fake {
@@ -33,23 +33,23 @@ const Fake = struct {
     fn wait(_: *anyopaque) anyerror!void {}
 
     /// Plane bytes of positions [pos, pos + n).
-    fn rows(f: *Fake, gpa: std.mem.Allocator, pos: usize, n: usize) ![]u8 {
+    pub fn rows(f: *Fake, gpa: std.mem.Allocator, pos: usize, n: usize) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         for (planes) |p| try out.appendSlice(gpa, f.mem[p.addr - origin + pos / p.ratio * p.row ..][0 .. n / p.ratio * p.row]);
         return out.toOwnedSlice(gpa);
     }
 
-    fn scramble(f: *Fake, seed: u64) void {
+    pub fn scramble(f: *Fake, seed: u64) void {
         var r = std.Random.DefaultPrng.init(seed);
         r.random().bytes(f.mem);
     }
 };
 
-fn scratch(buf: []u8, tag: []const u8) ![]const u8 {
+pub fn scratch(buf: []u8, tag: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "/tmp/tf-dsspill-{s}-{d}", .{ tag, std.c.getpid() });
 }
 
-fn rmDir(dir: []const u8) void {
+pub fn rmDir(dir: []const u8) void {
     var buf: [512]u8 = undefined;
     const d = std.c.opendir(std.fmt.bufPrintSentinel(&buf, "{s}", .{dir}, 0) catch return) orelse return;
     while (std.c.readdir(d)) |ent| {
@@ -62,7 +62,7 @@ fn rmDir(dir: []const u8) void {
     _ = std.c.rmdir(std.fmt.bufPrintSentinel(&buf, "{s}", .{dir}, 0) catch return);
 }
 
-fn count(dir: []const u8, suffix: []const u8) usize {
+pub fn count(dir: []const u8, suffix: []const u8) usize {
     var buf: [512]u8 = undefined;
     const d = std.c.opendir(std.fmt.bufPrintSentinel(&buf, "{s}", .{dir}, 0) catch return 0) orelse return 0;
     defer _ = std.c.closedir(d);
@@ -73,12 +73,12 @@ fn count(dir: []const u8, suffix: []const u8) usize {
     return n;
 }
 
-const Rig = struct {
+pub const Rig = struct {
     f: Fake,
     stage: []align(spill.page) u8,
     sp: Spill,
 
-    fn init(gpa: std.mem.Allocator, mem: []u8, dir: []const u8, stage_pages: usize) !*Rig {
+    pub fn init(gpa: std.mem.Allocator, mem: []u8, dir: []const u8, stage_pages: usize) !*Rig {
         const r = try gpa.create(Rig);
         r.f = .{ .mem = mem };
         r.stage = try gpa.alignedAlloc(u8, .fromByteUnits(spill.page), stage_pages * spill.page);
@@ -87,7 +87,7 @@ const Rig = struct {
         try r.sp.open(dir);
         return r;
     }
-    fn deinit(r: *Rig, gpa: std.mem.Allocator) void {
+    pub fn deinit(r: *Rig, gpa: std.mem.Allocator) void {
         r.sp.deinit();
         gpa.free(r.stage);
         gpa.destroy(r);

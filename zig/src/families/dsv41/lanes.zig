@@ -23,6 +23,7 @@ const link = @import("link.zig");
 const cuda = @import("cuda");
 const spill = @import("spill.zig");
 const spill_lanes = @import("spill_lanes.zig");
+const spill_async = @import("spill_async.zig");
 const watchdog = @import("watchdog.zig");
 
 const be = lanes.backend;
@@ -40,13 +41,13 @@ pub const image_piece = 32 << 10;
 pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, outcome u8, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, spill_sync = 10, spill_write = 11, spill_load = 12, spill_forget = 13 };
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, spill_sync = 10, spill_write = 11, spill_load = 12, spill_forget = 13, spill_wait = 14 };
 
 /// Whether the ranks compare outcomes at this frame: the pair's device work, not snap_drop, done or a spill frame.
 pub fn checked(kind: Kind) bool {
     return switch (kind) {
         .fill_begin, .fill_chunk, .verify, .pass, .fill_images, .snap_save, .snap_restore => true,
-        .snap_drop, .done, .spill_sync, .spill_write, .spill_load, .spill_forget => false,
+        .snap_drop, .done, .spill_sync, .spill_write, .spill_load, .spill_forget, .spill_wait => false,
     };
 }
 
@@ -136,6 +137,7 @@ pub fn header(r: *Reader) !Header {
         11 => .spill_write,
         12 => .spill_load,
         13 => .spill_forget,
+        14 => .spill_wait,
         else => return error.BadFrame,
     };
     const step = try r.int(u64);
@@ -536,6 +538,7 @@ pub const Lanes = struct {
     pub fn deinit(self: *Lanes) void {
         if (self.dog) |d| d.stop();
         self.dog = null;
+        if (self.spill) |t| spill_async.drain(t, self); // (no write still reads a kept state's buffer)
         for (self.snaps.items) |sn| {
             if (sn.disk) |d| self.gpa.free(d.names);
             sn.buf.free();
@@ -777,7 +780,7 @@ pub const Lanes = struct {
             s.reuse_failed = true;
         };
         // the rows this stream writes are no other kept state's
-        self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
+        try self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
         try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size });
         self.used[slot] = true;
         errdefer {
@@ -1110,6 +1113,7 @@ pub const Lanes = struct {
                 if (!sn.stale and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
             } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
             noteStale(victim, "a placement needed its room (oldest first)");
+            try spill_async.rowsGo(self, victim);
             victim.stale = true;
         }
     }
@@ -1128,9 +1132,12 @@ pub const Lanes = struct {
     }
 
     /// Kept states with rows in [lo, hi) go stale (a stream writes there), `except` aside.
-    fn staleOver(self: *Lanes, lo: usize, hi: usize, except: ?*Snap) void {
+    fn staleOver(self: *Lanes, lo: usize, hi: usize, except: ?*Snap) !void {
         for (self.snaps.items) |sn| if (sn != except and sn.base < hi and lo < sn.base + sn.at) {
-            if (!sn.stale) noteStale(sn, "a stream writes over its rows");
+            if (!sn.stale) {
+                noteStale(sn, "a stream writes over its rows");
+                try spill_async.rowsGo(self, sn);
+            }
             sn.stale = true;
         };
     }
@@ -1181,6 +1188,7 @@ pub const Lanes = struct {
             self.wire.int(self.gpa, u64, sn.id) catch {};
             self.flushLoose() catch |err| std.log.err("dsv41: rank 1 kept a dropped prompt state: {s}", .{@errorName(err)});
         }
+        spill_async.dropping(self, sn); // (a queued write of it reads its buffer)
         if (sn.disk) |d| self.gpa.free(d.names);
         sn.buf.free();
         self.gpa.destroy(sn);
@@ -1323,6 +1331,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier, dog: 
         while (ki.next()) |b| b.free();
         kept.deinit(gpa);
     }
+    defer if (tier) |t| spill_async.drain(t, null); // (before the buffers go: a queued write reads them)
     while (true) {
         ringFailed(m); // the last frame's rings (a failed one ended the waits, and a replayed graph went on)
         if (dog) |d| d.idle(); // waiting for the next frame is idle
@@ -1441,12 +1450,13 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model, tier: ?*spill_lanes.Tier, dog: 
             },
             .snap_drop => {
                 const id = try r.int(u64);
+                spill_async.followHold(tier, id, "its kept state is dropped");
                 if (kept.fetchRemove(id)) |kv| {
                     var b = kv.value;
                     b.free();
                 }
             },
-            .spill_sync, .spill_write, .spill_load, .spill_forget => try spill_lanes.follow(gpa, m, tier, kind, &r, &kept, peer),
+            .spill_sync, .spill_write, .spill_load, .spill_forget, .spill_wait => try spill_lanes.follow(gpa, m, tier, kind, &r, &kept, peer),
             .done => return,
         }
     }
@@ -1566,14 +1576,14 @@ test "snap_drop, done and the spill frames neither compare nor consume an outcom
     var f: FakeWire = .{};
     defer f.deinit();
     try std.testing.expect(try f.frame(.verify, false, true) == null); // a mixed primitive
-    for ([_]Kind{ .snap_drop, .spill_sync, .spill_write, .spill_load, .spill_forget, .done }) |k| {
+    for ([_]Kind{ .snap_drop, .spill_sync, .spill_write, .spill_load, .spill_forget, .spill_wait, .done }) |k| {
         try std.testing.expect(try f.frame(k, false, false) == null); // not here
     }
     try std.testing.expect(try f.frame(.pass, false, false) != null); // at the next checked frame
     var g: FakeWire = .{};
     defer g.deinit();
     try std.testing.expect(try g.frame(.fill_chunk, true, true) == null); // a refusal both ranks made
-    for ([_]Kind{ .snap_drop, .spill_write }) |k| try std.testing.expect(try g.frame(k, false, false) == null);
+    for ([_]Kind{ .snap_drop, .spill_write, .spill_wait }) |k| try std.testing.expect(try g.frame(k, false, false) == null);
     try std.testing.expect(try g.frame(.verify, false, false) == null); // still pending over the unchecked frames: equal
     try std.testing.expect(try g.frame(.verify, false, false) == null);
 }
@@ -1690,7 +1700,7 @@ test "retained histories preserve their replay and output reservations (PR #10: 
     // All eight 100K histories can resume within their reservations without invalidating a neighbor.
     for (&snapshots) |*sn| {
         try std.testing.expect(!ln.keptOver(sn.base + sn.at, sn.end, sn));
-        ln.staleOver(sn.base + sn.at, sn.end, sn);
+        try ln.staleOver(sn.base + sn.at, sn.end, sn);
     }
     for (snapshots) |sn| try std.testing.expect(!sn.stale);
     // a larger continuation resumes in place within its room to grow
@@ -1825,7 +1835,7 @@ test "only a round and a drafter pass leave the wall time between rounds unspoil
         try std.testing.expect(!try ln.begin(kind)); // (one rank: no frame)
         try std.testing.expect(!ln.pace.other);
     }
-    for ([_]Kind{ .fill_begin, .fill_chunk, .fill_images, .snap_save, .snap_restore, .snap_drop, .spill_sync, .spill_write, .spill_load, .spill_forget, .done }) |kind| {
+    for ([_]Kind{ .fill_begin, .fill_chunk, .fill_images, .snap_save, .snap_restore, .snap_drop, .spill_sync, .spill_write, .spill_load, .spill_forget, .spill_wait, .done }) |kind| {
         ln.pace.other = false;
         try std.testing.expect(!try ln.begin(kind));
         try std.testing.expect(ln.pace.other);

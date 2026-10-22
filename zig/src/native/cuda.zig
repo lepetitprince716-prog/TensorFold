@@ -421,6 +421,7 @@ fn spillTo(h: *Host, gpa: Allocator, sp: anytype) !void {
     h.snap_vt.forget = sp.forget;
     h.snap_vt.disk_bytes = sp.disk_bytes;
     h.snap_vt.known = sp.known;
+    if (@hasField(@TypeOf(sp), "settled")) h.snap_vt.settled = sp.settled;
     h.learned = try api.prompt_imprint.Imprint.open(gpa, sp.root, sp.identity, sp.cap);
     store.imprint = &h.learned.?;
     store.spill = true;

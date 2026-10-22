@@ -86,7 +86,7 @@ pub const Spill = struct {
         return n;
     }
 
-    fn blockFile(sp: *const Spill) usize {
+    pub fn blockFile(sp: *const Spill) usize {
         return page + std.mem.alignForward(usize, sp.blockBytes(), page);
     }
 
@@ -130,14 +130,14 @@ pub const Spill = struct {
         }
         for (blocks.items) |n| if (!sp.refs.contains(n)) {
             var buf: [1200]u8 = undefined;
-            _ = std.c.unlink(sp.blockPath(&buf, n) catch continue);
+            _ = std.c.unlink(blockPath(sp.dir, &buf, n) catch continue);
         };
     }
 
     /// A slot file's header and names into the state table (a buffered read: a page or two).
     fn loadSlot(sp: *Spill, key: u64) !void {
         var buf: [1200]u8 = undefined;
-        const fd = std.c.open(try sp.slotPath(&buf, key, false), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        const fd = std.c.open(try slotPath(sp.dir, &buf, key, false), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.SpillRead;
         defer _ = std.c.close(fd);
         var head: SlotHead = undefined;
@@ -161,14 +161,14 @@ pub const Spill = struct {
     }
 
     /// A state's names given back: blocks no other state names are deleted.
-    fn release(sp: *Spill, nm: []Name) void {
+    pub fn release(sp: *Spill, nm: []Name) void {
         for (nm) |n| if (sp.refs.getPtr(n)) |r| {
             r.* -= 1;
             if (r.* > 0) continue;
             _ = sp.refs.remove(n);
             _ = sp.bad.remove(n);
             var buf: [1200]u8 = undefined;
-            _ = std.c.unlink(sp.blockPath(&buf, n) catch continue);
+            _ = std.c.unlink(blockPath(sp.dir, &buf, n) catch continue);
         };
         sp.gpa.free(nm);
     }
@@ -177,7 +177,7 @@ pub const Spill = struct {
     pub fn forget(sp: *Spill, key: u64) void {
         const kv = sp.states.fetchRemove(key) orelse return;
         var buf: [1200]u8 = undefined;
-        if (sp.slotPath(&buf, key, false)) |p| {
+        if (slotPath(sp.dir, &buf, key, false)) |p| {
             _ = std.c.unlink(p);
         } else |_| {}
         sp.release(kv.value);
@@ -217,24 +217,24 @@ pub const Spill = struct {
         var i: usize = 0;
         while (i < todo.items.len) : (i += fit) {
             const batch = todo.items[i..@min(todo.items.len, i + fit)];
-            for (batch, 0..) |k, j| try sp.pull(sp.stage[j * per + page ..][0 .. per - page], base + k * sp.block);
+            for (batch, 0..) |k, j| try sp.pull(sp.dev, sp.stage[j * per + page ..][0 .. per - page], base + k * sp.block);
             try sp.dev.wait(sp.dev.ctx);
             for (batch, 0..) |k, j| {
-                try sp.writeBlock(nm[k], sp.stage[j * per ..][0..per]);
+                try sp.writeBlock(dir, nm[k], sp.stage[j * per ..][0..per]);
                 _ = sp.bad.remove(nm[k]);
             }
         }
-        try sp.writeSlot(key, at, nm, slot_src);
+        try sp.writeSlot(dir, sp.stage, sp.dev, key, at, nm, slot_src);
         syncDir(dir);
         try sp.register(key, owned);
     }
 
     /// The rows of the block at `pos` (every plane's, in order) into `out` (the rest zero).
-    fn pull(sp: *Spill, out: []u8, pos: usize) !void {
+    pub fn pull(sp: *const Spill, dev: Dev, out: []u8, pos: usize) !void {
         var off: usize = 0;
         for (sp.planes) |p| {
             const n = sp.block / p.ratio * p.row;
-            try sp.dev.to_host(sp.dev.ctx, out[off..][0..n], p.addr + pos / p.ratio * p.row);
+            try dev.to_host(dev.ctx, out[off..][0..n], p.addr + pos / p.ratio * p.row);
             off += n;
         }
         @memset(out[off..], 0);
@@ -249,51 +249,51 @@ pub const Spill = struct {
         }
     }
 
-    fn writeBlock(sp: *Spill, n: Name, file: []u8) !void {
+    pub fn writeBlock(sp: *const Spill, dir: []const u8, n: Name, file: []u8) !void {
         const len = sp.blockBytes();
         const head: BlockHead = .{ .magic = BLOCK_MAGIC, .version = VERSION, .name = n, .bytes = len, .sum = std.hash.XxHash3.hash(0, file[page..][0..len]) };
         @memset(file[0..page], 0);
         @memcpy(file[0..@sizeOf(BlockHead)], std.mem.asBytes(&head));
         var tmp: [1200]u8 = undefined;
         var fin: [1200]u8 = undefined;
-        const part = try std.fmt.bufPrintSentinel(&tmp, "{s}.part", .{try sp.blockPath(&fin, n)}, 0);
+        const part = try std.fmt.bufPrintSentinel(&tmp, "{s}.part", .{try blockPath(dir, &fin, n)}, 0);
         const fd = try sp.create(part);
         defer _ = std.c.close(fd);
         errdefer _ = std.c.unlink(part);
         try pwriteAll(fd, file, 0);
         if (std.c.fsync(fd) != 0) return error.SpillWrite;
-        if (std.c.rename(part, try sp.blockPath(&fin, n)) != 0) return error.SpillWrite;
+        if (std.c.rename(part, try blockPath(dir, &fin, n)) != 0) return error.SpillWrite;
     }
 
-    fn writeSlot(sp: *Spill, key: u64, at: usize, nm: []const Name, src: u64) !void {
+    pub fn writeSlot(sp: *const Spill, dir: []const u8, stage: []align(page) u8, dev: Dev, key: u64, at: usize, nm: []const Name, src: u64) !void {
         var tmp: [1200]u8 = undefined;
         var fin: [1200]u8 = undefined;
-        const part = try sp.slotPath(&tmp, key, true);
+        const part = try slotPath(dir, &tmp, key, true);
         const fd = try sp.create(part);
         defer _ = std.c.close(fd);
         errdefer _ = std.c.unlink(part);
         const head_len = slotHead(nm.len);
-        if (head_len > sp.stage.len) return error.StagingTooSmall;
+        if (head_len > stage.len) return error.StagingTooSmall;
         var sum = std.hash.XxHash3.init(0);
         var off: usize = 0;
         while (off < sp.slot_bytes) {
-            const n = @min(sp.stage.len, sp.slot_bytes - off);
-            try sp.dev.to_host(sp.dev.ctx, sp.stage[0..n], src + off);
-            try sp.dev.wait(sp.dev.ctx);
-            sum.update(sp.stage[0..n]);
+            const n = @min(stage.len, sp.slot_bytes - off);
+            try dev.to_host(dev.ctx, stage[0..n], src + off);
+            try dev.wait(dev.ctx);
+            sum.update(stage[0..n]);
             const padded = std.mem.alignForward(usize, n, page);
-            @memset(sp.stage[n..padded], 0);
-            try pwriteAll(fd, sp.stage[0..padded], head_len + off);
+            @memset(stage[n..padded], 0);
+            try pwriteAll(fd, stage[0..padded], head_len + off);
             off += n;
         }
         const head: SlotHead = .{ .magic = SLOT_MAGIC, .version = VERSION, .key = key, .at = at, .blocks = nm.len, .slot = sp.slot_bytes, .sum = sum.final() };
-        const region = sp.stage[0..head_len];
+        const region = stage[0..head_len];
         @memset(region, 0);
         @memcpy(region[0..@sizeOf(SlotHead)], std.mem.asBytes(&head));
         @memcpy(region[@sizeOf(SlotHead)..][0 .. nm.len * @sizeOf(Name)], std.mem.sliceAsBytes(nm));
         try pwriteAll(fd, region, 0);
         if (std.c.fsync(fd) != 0) return error.SpillWrite;
-        if (std.c.rename(part, try sp.slotPath(&fin, key, false)) != 0) return error.SpillWrite;
+        if (std.c.rename(part, try slotPath(dir, &fin, key, false)) != 0) return error.SpillWrite;
     }
 
     /// State `key` back: blocks into the extent at `base`, slot part into `slot_dst` (null: held); a bad file fails it.
@@ -321,7 +321,7 @@ pub const Spill = struct {
 
     fn readBlock(sp: *Spill, n: Name, file: []u8) !void {
         var buf: [1200]u8 = undefined;
-        const fd = try sp.openRead(try sp.blockPath(&buf, n));
+        const fd = try sp.openRead(try blockPath(sp.dir, &buf, n));
         defer _ = std.c.close(fd);
         if (!readAt(fd, file, 0)) return error.SpillRead;
         const head = std.mem.bytesToValue(BlockHead, file[0..@sizeOf(BlockHead)]);
@@ -336,12 +336,12 @@ pub const Spill = struct {
             _ = sp.refs.remove(n); // out of memory: unnamed instead (a later release skips it)
         };
         var buf: [1200]u8 = undefined;
-        _ = std.c.unlink(sp.blockPath(&buf, n) catch return);
+        _ = std.c.unlink(blockPath(sp.dir, &buf, n) catch return);
     }
 
     fn readSlot(sp: *Spill, key: u64, at: usize, blocks: usize, dst: u64) !void {
         var buf: [1200]u8 = undefined;
-        const fd = try sp.openRead(try sp.slotPath(&buf, key, false));
+        const fd = try sp.openRead(try slotPath(sp.dir, &buf, key, false));
         defer _ = std.c.close(fd);
         const head_len = slotHead(blocks);
         if (head_len > sp.stage.len) return error.StagingTooSmall;
@@ -360,14 +360,6 @@ pub const Spill = struct {
         }
         sp.read_bytes += head_len + std.mem.alignForward(usize, sp.slot_bytes, page);
         if (sum.final() != head.sum) return error.SpillBadSlot;
-    }
-
-    fn blockPath(sp: *const Spill, buf: []u8, n: Name) ![:0]const u8 {
-        return std.fmt.bufPrintSentinel(buf, "{s}/{x:0>16}{x:0>16}.blk", .{ sp.dir orelse return error.SpillClosed, n[0], n[1] }, 0);
-    }
-
-    fn slotPath(sp: *const Spill, buf: []u8, key: u64, part: bool) ![:0]const u8 {
-        return std.fmt.bufPrintSentinel(buf, "{s}/{x:0>16}.slot{s}", .{ sp.dir orelse return error.SpillClosed, key, if (part) ".part" else "" }, 0);
     }
 
     fn unlinkName(sp: *const Spill, name: []const u8) void {
@@ -496,7 +488,15 @@ fn readAt(fd: std.c.fd_t, dest: []u8, at: usize) bool {
     return true;
 }
 
-fn syncDir(dir: [:0]const u8) void {
+fn blockPath(dir: ?[]const u8, buf: []u8, n: Name) ![:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, "{s}/{x:0>16}{x:0>16}.blk", .{ dir orelse return error.SpillClosed, n[0], n[1] }, 0);
+}
+
+fn slotPath(dir: ?[]const u8, buf: []u8, key: u64, part: bool) ![:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, "{s}/{x:0>16}.slot{s}", .{ dir orelse return error.SpillClosed, key, if (part) ".part" else "" }, 0);
+}
+
+pub fn syncDir(dir: [:0]const u8) void {
     const fd = std.c.open(dir, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return;
     _ = std.c.fsync(fd);
@@ -506,7 +506,7 @@ fn syncDir(dir: [:0]const u8) void {
 extern "c" fn statvfs(path: [*:0]const u8, buf: *[16]u64) c_int;
 
 /// Bytes free to an unprivileged writer on `dir`'s file system (Linux; elsewhere unbounded).
-fn freeBytes(dir: [:0]const u8) u64 {
+pub fn freeBytes(dir: [:0]const u8) u64 {
     if (builtin.os.tag != .linux) return std.math.maxInt(u64) / 2;
     var v: [16]u64 = @splat(0); // glibc's struct statvfs on 64-bit Linux: f_bsize, f_frsize, f_blocks, f_bfree, f_bavail
     if (statvfs(dir.ptr, &v) != 0) return 0;

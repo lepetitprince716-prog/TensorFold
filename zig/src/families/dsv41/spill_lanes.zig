@@ -6,6 +6,7 @@ const model = @import("model.zig");
 const prompt = @import("prompt.zig");
 const spill = @import("spill.zig");
 const link = @import("link.zig");
+const bgw = @import("spill_async.zig");
 const Lanes = lanes.Lanes;
 const Snap = lanes.Snap;
 const Reader = lanes.Reader;
@@ -16,6 +17,7 @@ pub const Settings = struct {
     cap: u64, // TF_DS_SPILL_GIB (default 200): every identity's files under `root` together
     min_tokens: u32, // TF_DS_SPILL_MIN_TOKENS (default 8192): shorter conversation states stay in memory
     staging: usize, // TF_DS_SPILL_STAGING_MIB (default 32): pinned host memory for the copies
+    background: bool = false, // TF_DS_SPILL_ASYNC=1: writes on a writer thread with staging of its own (default off)
 
     pub fn read() !?Settings {
         const root = env("TF_DS_SPILL_DIR") orelse return null;
@@ -24,7 +26,8 @@ pub const Settings = struct {
         const min = if (env("TF_DS_SPILL_MIN_TOKENS")) |v| std.fmt.parseInt(u32, v, 10) catch return error.BadSpillMin else 8192;
         const mib = if (env("TF_DS_SPILL_STAGING_MIB")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadSpillStaging else 32;
         if (gib <= 0 or mib == 0) return null;
-        return .{ .root = root, .cap = @intFromFloat(gib * (1 << 30)), .min_tokens = min, .staging = mib << 20 };
+        const bg = if (env("TF_DS_SPILL_ASYNC")) |v| v.len > 0 and !std.mem.eql(u8, v, "0") else false;
+        return .{ .root = root, .cap = @intFromFloat(gib * (1 << 30)), .min_tokens = min, .staging = mib << 20, .background = bg };
     }
 
     fn env(name: [:0]const u8) ?[]const u8 {
@@ -38,6 +41,7 @@ pub const Tier = struct {
     host: cuda.HostBuffer,
     settings: Settings,
     identity: u64,
+    bg: ?*bgw.Background = null, // TF_DS_SPILL_ASYNC=1 (null: the engine thread writes, as before)
 
     pub fn open(gpa: std.mem.Allocator, m: *model.Model, s: Settings, id: u64) !*Tier {
         const t = try gpa.create(Tier);
@@ -51,11 +55,18 @@ pub const Tier = struct {
         const planes = try m.spillPlanes(gpa);
         defer gpa.free(planes);
         t.sp = try spill.Spill.init(gpa, planes, model.chunk_rows, m.snapBytes(), m.spillDev(), stage);
+        errdefer t.sp.deinit();
         std.log.info("dsv41: kept prompt states spill to {s} ({d} MiB a block of {d} tokens, {d} MiB a slot part)", .{ s.root, t.sp.blockBytes() >> 20, model.chunk_rows, m.snapBytes() >> 20 });
+        t.bg = null;
+        if (s.background) {
+            t.bg = try bgw.Background.open(gpa, m, t, s.staging);
+            std.log.info("dsv41: spill writes run on a writer thread (TF_DS_SPILL_ASYNC=1)", .{});
+        }
         return t;
     }
 
     pub fn close(t: *Tier, gpa: std.mem.Allocator) void {
+        if (t.bg) |b| b.close(gpa, t);
         t.sp.deinit();
         t.host.free();
         gpa.destroy(t);
@@ -80,11 +91,11 @@ pub fn identity(gpa: std.mem.Allocator, m: *const model.Model, o: model.Options)
     return id.final();
 }
 
-fn of(ptr: *anyopaque) *Lanes {
+pub fn of(ptr: *anyopaque) *Lanes {
     return @ptrCast(@alignCast(ptr));
 }
 
-fn names(w: *lanes.Wire, gpa: std.mem.Allocator, nm: []const spill.Name) !void {
+pub fn names(w: *lanes.Wire, gpa: std.mem.Allocator, nm: []const spill.Name) !void {
     try w.int(gpa, u32, @intCast(nm.len));
     for (nm) |n| {
         try w.int(gpa, u64, n[0]);
@@ -102,7 +113,7 @@ fn readNames(r: *Reader, gpa: std.mem.Allocator) ![]spill.Name {
 }
 
 /// A kept state's disk copy noted (its names now the snap's).
-fn attach(gpa: std.mem.Allocator, sn: *Snap, key: u64, nm: []spill.Name) void {
+pub fn attach(gpa: std.mem.Allocator, sn: *Snap, key: u64, nm: []spill.Name) void {
     if (sn.disk) |d| gpa.free(d.names);
     sn.disk = .{ .key = key, .names = nm };
 }
@@ -113,6 +124,7 @@ pub fn writeFn(ptr: *anyopaque, saved: *anyopaque, dir: [:0]const u8, key: u64, 
     const t = ln.spill orelse return error.NoSpill;
     const sn: *Snap = @ptrCast(@alignCast(saved));
     if (sn.stale or !sn.slot) return error.RowsGone; // (the store writes right after the save)
+    if (t.bg) |b| return bgw.queue(ln, t, b, sn, dir, key, tokens);
     try t.sp.open(dir);
     const nm = try spill.names(ln.gpa, tokens, sn.at, model.chunk_rows);
     errdefer ln.gpa.free(nm);
@@ -138,6 +150,7 @@ pub fn readFn(ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32, tokens: []c
     const t = ln.spill orelse return error.NoSpill;
     try ln.m.ctx.makeCurrent(); // (the lane thread may look up before its first backend call)
     try t.sp.open(dir);
+    if (t.bg != null) bgw.settleKey(t, ln, key, "it is read back");
     if (at % model.chunk_rows != 0) return error.NotABlockEnd;
     const nm = try spill.names(ln.gpa, tokens, at, model.chunk_rows);
     errdefer ln.gpa.free(nm);
@@ -160,6 +173,7 @@ pub fn forgetFn(ptr: *anyopaque, dir: [:0]const u8, key: u64) void {
 }
 
 fn forget(ln: *Lanes, t: *Tier, key: u64) void {
+    if (t.bg != null) bgw.settleKey(t, ln, key, "it is forgotten");
     t.sp.forget(key);
     for (ln.snaps.items) |sn| if (sn.disk) |d| if (d.key == key) {
         ln.gpa.free(d.names);
@@ -181,6 +195,7 @@ pub fn knownFn(ptr: *anyopaque, dir: [:0]const u8, keys: []const u64) u8 {
     const ln = of(ptr);
     const t = ln.spill orelse return 2;
     t.sp.open(dir) catch return 2;
+    bgw.drain(t, ln);
     t.sp.keepOnly(keys) catch {};
     var peers = std.hash.Wyhash.init(0);
     ln.busyStartup("spill_sync"); // waits on every follower, which may still be loading: TF_DS_WATCHDOG_START_S, not _S
@@ -214,6 +229,7 @@ pub fn knownFn(ptr: *anyopaque, dir: [:0]const u8, keys: []const u64) u8 {
 pub fn load(ln: *Lanes, sn: *Snap, base: usize) !void {
     const t = ln.spill orelse return error.NoSpill;
     const d = sn.disk orelse return error.NoDiskCopy;
+    bgw.settleKey(t, ln, d.key, "a pass loads it");
     if (try ln.begin(.spill_load)) {
         try ln.wire.int(ln.gpa, u64, sn.id);
         try ln.wire.int(ln.gpa, u64, d.key);
@@ -255,6 +271,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *model.Model, t: ?*Tier, kind: lanes.Ki
             defer w.deinit(gpa);
             try w.int(gpa, u8, @intFromBool(t != null));
             try w.int(gpa, u64, if (t) |x| x.identity else 0);
+            if (t) |x| bgw.drain(x, null);
             if (t) |x| x.sp.keepOnly(keys) catch |err| std.log.err("dsv41: spill sync: {s}", .{@errorName(err)});
             try peer.send(w.buf.items);
         },
@@ -267,6 +284,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *model.Model, t: ?*Tier, kind: lanes.Ki
             defer gpa.free(nm);
             const x = t orelse return;
             const b = kept.get(id) orelse return;
+            if (x.bg != null) return bgw.followWrite(m, x, id, key, at, nm, base, b.ptr);
             x.sp.write(key, at, nm, base, b.ptr) catch |err| std.log.err("dsv41: spilling {d} tokens failed: {s}", .{ at, @errorName(err) });
         },
         .spill_load => {
@@ -277,13 +295,16 @@ pub fn follow(gpa: std.mem.Allocator, m: *model.Model, t: ?*Tier, kind: lanes.Ki
             const slot = try r.int(u8) != 0;
             const nm = try readNames(r, gpa);
             defer gpa.free(nm);
+            if (t) |x| bgw.settleKey(x, null, key, "a pass loads it");
             const ok = loadHere(gpa, m, t, kept, id, key, at, base, slot, nm);
             try peer.send(&.{@intFromBool(ok)});
         },
         .spill_forget => {
             const key = try r.int(u64);
+            if (t) |x| bgw.settleKey(x, null, key, "it is forgotten");
             if (t) |x| x.sp.forget(key);
         },
+        .spill_wait => bgw.followHold(t, try r.int(u64), "its rows go to another stream"),
         else => return error.BadFrame,
     }
 }

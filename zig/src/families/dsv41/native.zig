@@ -34,6 +34,7 @@ const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
 const vision_mod = @import("vision.zig");
 const spill_lanes = @import("spill_lanes.zig");
+const spill_async = @import("spill_async.zig");
 const sampling = @import("sampling.zig");
 
 pub const model_type = "deepseek_v41";
@@ -85,6 +86,7 @@ pub const Spill = struct {
     forget: *const fn (*anyopaque, [:0]const u8, u64) void,
     disk_bytes: *const fn (*anyopaque, u32) u64,
     known: *const fn (*anyopaque, [:0]const u8, []const u64) u8,
+    settled: ?*const fn (*anyopaque, []u64, []?anyerror, bool) usize = null, // TF_DS_SPILL_ASYNC=1: writes end later
     root: []const u8,
     cap: u64,
     min_tokens: u32,
@@ -186,7 +188,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
     var snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
-    if (st.tier) |t| snaps.spill = .{ .write = spill_lanes.writeFn, .read = spill_lanes.readFn, .forget = spill_lanes.forgetFn, .disk_bytes = spill_lanes.diskBytesFn, .known = spill_lanes.knownFn, .root = t.settings.root, .cap = t.settings.cap, .min_tokens = t.settings.min_tokens, .identity = t.identity };
+    if (st.tier) |t| snaps.spill = .{ .write = spill_lanes.writeFn, .read = spill_lanes.readFn, .forget = spill_lanes.forgetFn, .disk_bytes = spill_lanes.diskBytesFn, .known = spill_lanes.knownFn, .settled = if (t.bg != null) spill_async.settledFn else null, .root = t.settings.root, .cap = t.settings.cap, .min_tokens = t.settings.min_tokens, .identity = t.identity };
     st.lanes.dog = try lanes_mod.watch(gpa, io, st.m); // last: nothing after it can fail with the thread running
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
 }

@@ -37,6 +37,8 @@ pub const Snapshots = struct {
         disk_bytes: ?*const fn (ptr: *anyopaque, at: u32) u64 = null,
         /// The states the index holds when the store opens on `dir`: the family drops any other's files, says a Known.
         known: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, keys: []const u64) u8 = null,
+        /// `write` only queues: the keys of writes finished since (each its error or null), all of them when `wait`.
+        settled: ?*const fn (ptr: *anyopaque, keys: []u64, failures: []?anyerror, wait: bool) usize = null,
     };
 
     /// What `known` found: the index stands, none of it reads back any more (a peer's files changed), or no disk tier.
@@ -89,14 +91,21 @@ pub const Store = struct {
     imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
     spill: bool = false, // every kept state to the imprint, hashed: an evicted or restarted conversation resumes there
     min_spill: u32 = 0, // spill: a conversation's state shorter than this stays in memory (shared cuts go at any length)
+    pending: std.ArrayList(Pending) = .empty, // spill writes the family queued: listed in the index once they finished
 
     const SHARED_KEYS = 64;
+
+    /// A queued spill write's index record, made when it is queued (the entry and its tokens may be gone when it ends).
+    const Pending = struct { key: u64, at: u32, n: u32, check: u64, starts: []u32, bytes: u64 };
 
     pub fn init(gpa: Allocator, family: Snapshots, rules: Rules, budget: u64) Store {
         return .{ .gpa = gpa, .family = family, .rules = rules, .budget = budget };
     }
 
     pub fn deinit(s: *Store) void {
+        s.settle(true); // the queued writes end before their states go
+        for (s.pending.items) |p| s.gpa.free(p.starts);
+        s.pending.deinit(s.gpa);
         for (s.entries.items) |e| s.free(e);
         s.entries.deinit(s.gpa);
         s.shared_keys.deinit(s.gpa);
@@ -160,6 +169,7 @@ pub const Store = struct {
 
     /// begin without the restore, for backends that restore inside their own prompt pass and then call `resumed`.
     pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32) !Lookup {
+        s.settle(false);
         const e = s.recall(prompt, starts, s.find(prompt, starts));
         if (e == null) s.counts.misses += 1;
         const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
@@ -321,16 +331,63 @@ pub const Store = struct {
         const im = s.imprint orelse return;
         const write = s.family.vtable.write orelse return;
         if (s.spill and !e.shared and e.at < s.min_spill) return;
+        const queued = s.spill and s.family.vtable.settled != null;
+        if (queued) s.settle(false);
         const key = imprint.Imprint.keyOf(e.tokens);
         const bytes = if (s.family.vtable.disk_bytes) |f| f(s.family.ptr, e.at) else e.bytes;
         const known = im.has(key);
         if ((known and !s.spill) or bytes > im.cap) return;
-        if (!known) while (!im.fits(bytes)) s.unlearn(im, im.victim() orelse return); // the least recently used go first
+        if (queued and s.pendingOf(key) != null) return; // its write is under way
+        if (!known) while (!im.fits(bytes + s.pendingBytes())) s.unlearn(im, im.victim() orelse return); // least recently used first
         write(s.family.ptr, e.saved, im.dir, key, e.tokens) catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
         if (known) return im.touch(key); // already on disk: the family noted it for this kept state
+        if (queued) return s.queue(key, e, starts, bytes);
         const added = if (s.spill) im.addHashed(key, e.at, e.tokens, starts, bytes) else im.add(key, e.at, e.tokens, starts, bytes);
         added catch |err| return note("learning {d} tokens failed ({s})", .{ e.at, @errorName(err) });
         if (!@import("builtin").is_test) std.log.info("prompt cache: learned {d} tokens to disk", .{e.at});
+    }
+
+    /// A queued write's record kept until the family says it finished (no room for it: it is never listed).
+    fn queue(s: *Store, key: u64, e: *const Entry, starts: []const u32, bytes: u64) void {
+        const st = s.gpa.dupe(u32, starts) catch return note("learning {d} tokens failed ({s})", .{ e.at, "OutOfMemory" });
+        const p: Pending = .{ .key = key, .at = e.at, .n = @intCast(e.tokens.len), .check = imprint.Imprint.checkOf(e.tokens), .starts = st, .bytes = bytes };
+        s.pending.append(s.gpa, p) catch {
+            s.gpa.free(st);
+            note("learning {d} tokens failed ({s})", .{ e.at, "OutOfMemory" });
+        };
+    }
+
+    fn pendingOf(s: *const Store, key: u64) ?usize {
+        for (s.pending.items, 0..) |p, i| if (p.key == key) return i;
+        return null;
+    }
+
+    /// The disk the queued writes will take: the cap counts them before they are listed.
+    fn pendingBytes(s: *const Store) u64 {
+        var n: u64 = 0;
+        for (s.pending.items) |p| n += p.bytes;
+        return n;
+    }
+
+    /// The family's queued writes that finished, each listed in the index (or noted, failed); `wait`: all of them.
+    pub fn settle(s: *Store, wait: bool) void {
+        const f = s.family.vtable.settled orelse return;
+        var keys: [16]u64 = undefined;
+        var failures: [16]?anyerror = undefined;
+        while (true) {
+            const n = f(s.family.ptr, &keys, &failures, wait);
+            for (keys[0..n], failures[0..n]) |k, x| s.listed(k, x);
+            if (n < keys.len) return;
+        }
+    }
+
+    fn listed(s: *Store, key: u64, failure: ?anyerror) void {
+        const p = s.pending.orderedRemove(s.pendingOf(key) orelse return); // (none: a known state's rewrite)
+        defer s.gpa.free(p.starts);
+        if (failure) |err| return note("learning {d} tokens failed ({s})", .{ p.at, @errorName(err) });
+        const im = s.imprint orelse return;
+        im.addSummed(p.key, p.at, p.n, p.check, p.starts, p.bytes) catch |err| return note("learning {d} tokens failed ({s})", .{ p.at, @errorName(err) });
+        if (!@import("builtin").is_test) std.log.info("prompt cache: learned {d} tokens to disk", .{p.at});
     }
 
     /// The imprint just opened: kept as its files are, cleared (a peer's files changed), or dropped (false: free it).

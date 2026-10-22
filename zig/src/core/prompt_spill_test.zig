@@ -201,3 +201,114 @@ test "a state on disk too near the prompt's end for the family's tail is passed 
     try std.testing.expectEqual(@as(u32, 5), p.from);
     try std.testing.expectEqual(fresh(&far), f.pass(&s, &far, p));
 }
+
+/// A family whose spill writes finish when the test says (settled): the writes it queued, those finished, a failure.
+const Later = struct {
+    keys: [16]u64 = undefined,
+    n: usize = 0, // queued
+    done: usize = 0, // finished: the first `done` of them
+    told: usize = 0, // the store heard of these
+    fail_key: ?u64 = null,
+    var it: Later = .{};
+    var write: *const fn (*anyopaque, pc.Saved, [:0]const u8, u64, []const u32) anyerror!void = undefined;
+
+    fn vtable(f: *Fake) pc.Snapshots.VTable {
+        it = .{};
+        var vt = f.learned().vtable.*;
+        write = vt.write.?;
+        vt.write = writeFn;
+        vt.settled = settledFn;
+        return vt;
+    }
+    fn writeFn(ptr: *anyopaque, saved: pc.Saved, dir: [:0]const u8, key: u64, tokens: []const u32) anyerror!void {
+        try write(ptr, saved, dir, key, tokens);
+        it.keys[it.n] = key;
+        it.n += 1;
+    }
+    fn settledFn(_: *anyopaque, keys: []u64, failures: []?anyerror, wait: bool) usize {
+        if (wait) it.done = it.n;
+        var k: usize = 0;
+        while (it.told < it.done and k < keys.len) : (k += 1) {
+            keys[k] = it.keys[it.told];
+            failures[k] = if (it.fail_key == it.keys[it.told]) error.SpillWrite else null;
+            it.told += 1;
+        }
+        return k;
+    }
+};
+
+test "a queued spill write is in the index only once it finished: before, a later turn finds nothing on disk" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [128]u8 = undefined;
+    const root = try scratch(&buf, "queued");
+    defer rmTree(root);
+    var im = try Imprint.open(gpa, root, 4, 1 << 30);
+    defer im.deinit();
+    var f: Fake = .{ .gpa = gpa };
+    const vt = Later.vtable(&f);
+    var s = Store.init(gpa, .{ .ptr = &f, .vtable = &vt }, rules, 110); // one state at 5 (105 bytes) fits in memory
+    defer s.deinit();
+    s.imprint = &im;
+    s.spill = true;
+    const ca = [_]u32{ 1, 2, 3, 4, 5, 9, 9 };
+    const cb = [_]u32{ 6, 6, 6, 6, 6, 9, 9 };
+    try std.testing.expectEqual(fresh(&ca), f.pass(&s, &ca, try s.begin(a, &ca, 5, &.{}, &.{}, null)));
+    try std.testing.expectEqual(@as(usize, 1), s.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), im.metas.items.len); // queued, not listed
+    try std.testing.expectEqual(fresh(&cb), f.pass(&s, &cb, try s.begin(a, &cb, 5, &.{}, &.{}, null))); // evicts ca
+    try std.testing.expect(s.find(&ca, &.{}) == null);
+    const ca2 = ca[0..5].* ++ [_]u32{ 9, 8, 8, 9, 9 };
+    var p = try s.begin(a, &ca2, 9, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 0), p.from); // ca's write has not finished: not on disk for the lookup
+    try std.testing.expectEqual(fresh(&ca2), f.pass(&s, &ca2, p));
+    Later.it.done = 1; // ca's write finished
+    const ca3 = ca[0..5].* ++ [_]u32{ 7, 7, 7, 9, 9 };
+    p = try s.begin(a, &ca3, 5, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 5), p.from); // listed at this lookup, read back
+    try std.testing.expectEqual(fresh(&ca3), f.pass(&s, &ca3, p));
+    try std.testing.expect(im.has(Imprint.keyOf(ca[0..5])) and !im.has(Imprint.keyOf(cb[0..5])));
+}
+
+test "the cap counts queued writes; a failed one is noted and never listed; deinit lists the rest" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [128]u8 = undefined;
+    const root = try scratch(&buf, "qcap");
+    defer rmTree(root);
+    var im = try Imprint.open(gpa, root, 4, 2 * 105 + 50); // two states at 5 (105 bytes each) under the cap
+    defer im.deinit();
+    const c1 = [_]u32{ 1, 1, 1, 1, 1, 9, 9 };
+    const c2 = [_]u32{ 2, 2, 2, 2, 2, 9, 9 };
+    const c3 = [_]u32{ 3, 3, 3, 3, 3, 9, 9 };
+    const c4 = [_]u32{ 4, 4, 4, 4, 4, 9, 9 };
+    {
+        var f: Fake = .{ .gpa = gpa };
+        const vt = Later.vtable(&f);
+        var s = Store.init(gpa, .{ .ptr = &f, .vtable = &vt }, rules, 1 << 20);
+        defer s.deinit();
+        s.imprint = &im;
+        s.spill = true;
+        _ = f.pass(&s, &c1, try s.begin(a, &c1, 5, &.{}, &.{}, null));
+        Later.it.done = 1;
+        _ = f.pass(&s, &c2, try s.begin(a, &c2, 5, &.{}, &.{}, null)); // lists c1, queues c2
+        try std.testing.expectEqual(@as(usize, 1), im.metas.items.len);
+        _ = f.pass(&s, &c3, try s.begin(a, &c3, 5, &.{}, &.{}, null)); // c1 listed and c2 queued fill the cap: c1 goes
+        try std.testing.expectEqual(@as(usize, 0), im.metas.items.len);
+        try std.testing.expectEqual(@as(usize, 2), s.pending.items.len);
+        Later.it.fail_key = Imprint.keyOf(c2[0..5]);
+        Later.it.done = 3;
+        _ = f.pass(&s, &c4, try s.begin(a, &c4, 5, &.{}, &.{}, null)); // c2 failed, c3 listed, c4 queued
+        try std.testing.expect(!im.has(Imprint.keyOf(c2[0..5])) and im.has(Imprint.keyOf(c3[0..5])));
+        try std.testing.expectEqual(@as(usize, 1), s.pending.items.len);
+    } // deinit: c4 waited for and listed
+    try std.testing.expect(im.has(Imprint.keyOf(c4[0..5])));
+    try std.testing.expect(im.total() <= im.cap);
+    var again = try Imprint.open(gpa, root, 4, 1 << 30);
+    defer again.deinit();
+    try std.testing.expect(again.has(Imprint.keyOf(c3[0..5])) and again.has(Imprint.keyOf(c4[0..5])));
+}

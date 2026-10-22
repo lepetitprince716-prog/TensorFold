@@ -51,6 +51,8 @@ pub const watchdog = @import("watchdog.zig");
 pub const lanes = @import("lanes.zig");
 pub const spill = @import("spill.zig");
 pub const spill_lanes = @import("spill_lanes.zig");
+pub const spill_writer = @import("spill_writer.zig");
+pub const spill_async = @import("spill_async.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -100,4 +102,6 @@ test {
     refAll(lanes);
     refAll(spill);
     refAll(spill_lanes);
+    refAll(spill_writer);
+    refAll(spill_async);
 }
