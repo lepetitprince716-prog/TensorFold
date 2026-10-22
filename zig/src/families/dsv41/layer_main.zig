@@ -213,6 +213,7 @@ pub fn main(init: std.process.Init) !u8 {
     const ip = try dsv41.link.parseIp(args[5]);
     const port = try std.fmt.parseInt(u16, args[6], 10);
     const rec = args[7];
+    prompt.aliasEnv(); // TF_DS_PROMPT_ALIAS
     var layers: usize = 1;
     var chunks: usize = 1;
     var check_from: usize = 0;
