@@ -346,3 +346,91 @@ test "the queue holds max_queue writes; one more is refused until the oldest ran
     try std.testing.expectEqual(@as(u64, 0), b.w.queued());
     for (0..jobs.len) |i| try std.testing.expect(b.rig.sp.has(200 + i));
 }
+
+test "only the text 1 turns the writer thread on" {
+    try std.testing.expect(writer.knobOn("1"));
+    for ([_]?[]const u8{ null, "", "0", "false", "off", "no", "true", "on", "yes", "2", "01", "11", " 1", "1 ", "-1" }) |text| {
+        try std.testing.expect(!writer.knobOn(text));
+    }
+}
+
+/// Stands in for lanes.Wire: the same `int`, little-endian.
+const Buf = struct {
+    list: std.ArrayList(u8) = .empty,
+
+    pub fn int(b: *Buf, gpa: std.mem.Allocator, comptime T: type, v: T) !void {
+        var x: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(T, &x, v, .little);
+        try b.list.appendSlice(gpa, &x);
+    }
+};
+
+/// Stands in for lanes.Reader: the same `int`, and a short frame is an error that reads nothing.
+const Cursor = struct {
+    b: []const u8,
+    at: usize = 0,
+
+    pub fn int(r: *Cursor, comptime T: type) !T {
+        const n = @sizeOf(T);
+        if (r.at + n > r.b.len) return error.ShortFrame;
+        const v = std.mem.readInt(T, r.b[r.at..][0..n], .little);
+        r.at += n;
+        return v;
+    }
+};
+
+/// One start-up exchange: rank 0's frame (after its header) read by a follower with a tier, rank 0 reading the reply.
+fn exchange(gpa: std.mem.Allocator, keys: []const u64, rank0: bool, rank1: bool, frame: *Buf, reply: *Buf) !writer.Answer {
+    try writer.putSync(frame, gpa, keys, rank0);
+    var r: Cursor = .{ .b = frame.list.items };
+    const n = try r.int(u32);
+    try std.testing.expectEqual(@as(u32, @intCast(keys.len)), n);
+    for (keys) |k| try std.testing.expectEqual(k, try r.int(u64));
+    const theirs = writer.readMode(&r);
+    try std.testing.expectEqual(rank0, theirs);
+    try std.testing.expectEqual(frame.list.items.len, r.at); // the frame read whole
+    try writer.putAnswer(reply, gpa, writer.answer(true, rank1, theirs), 0x1122334455667788);
+    var back: Cursor = .{ .b = reply.list.items };
+    const a = writer.answerOf(try back.int(u8));
+    try std.testing.expectEqual(@as(u64, 0x1122334455667788), try back.int(u64));
+    return a;
+}
+
+test "spill_sync: ranks that agree on the writer mode exchange the bytes they always did; one that does not says so" {
+    const gpa = std.testing.allocator;
+    const keys = [_]u64{ 0x0102030405060708, 9 };
+    const old_frame = [_]u8{ 2, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 9, 0, 0, 0, 0, 0, 0, 0 }; // count, then the keys: today's frame
+    const old_reply = [_]u8{ 1, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11 }; // tier on, identity: today's reply
+    for ([_][2]bool{ .{ false, false }, .{ true, true }, .{ false, true }, .{ true, false } }) |modes| {
+        var frame: Buf = .{};
+        defer frame.list.deinit(gpa);
+        var reply: Buf = .{};
+        defer reply.list.deinit(gpa);
+        const got = try exchange(gpa, &keys, modes[0], modes[1], &frame, &reply);
+        if (modes[0] == modes[1]) {
+            try std.testing.expectEqual(writer.Answer.same, got);
+            try std.testing.expectEqualSlices(u8, &old_reply, reply.list.items); // an agreeing pair's reply is today's
+        } else {
+            try std.testing.expectEqual(writer.Answer.differs, got);
+            try std.testing.expectEqual(@as(u8, 2), reply.list.items[0]);
+        }
+        if (modes[0]) {
+            try std.testing.expectEqualSlices(u8, &old_frame, frame.list.items[0..old_frame.len]); // only a byte is added
+            try std.testing.expectEqualSlices(u8, &.{writer.mode_byte}, frame.list.items[old_frame.len..]);
+        } else try std.testing.expectEqualSlices(u8, &old_frame, frame.list.items); // writes on the engine thread: today's frame
+    }
+}
+
+test "spill_sync: a follower without a tier answers none whatever rank 0 says; a byte this build never sends is another mode" {
+    for ([_]bool{ false, true }) |theirs| for ([_]bool{ false, true }) |mine| {
+        try std.testing.expectEqual(writer.Answer.no_tier, writer.answer(false, mine, theirs));
+    };
+    try std.testing.expectEqual(writer.Answer.no_tier, writer.answerOf(0));
+    try std.testing.expectEqual(writer.Answer.same, writer.answerOf(1));
+    try std.testing.expectEqual(writer.Answer.differs, writer.answerOf(2));
+    try std.testing.expectEqual(writer.Answer.differs, writer.answerOf(3));
+    var none: Cursor = .{ .b = &.{} }; // no byte after the keys: rank 0's writes stay on the engine thread
+    try std.testing.expect(!writer.readMode(&none));
+    var other: Cursor = .{ .b = &.{2} };
+    try std.testing.expect(!writer.readMode(&other));
+}

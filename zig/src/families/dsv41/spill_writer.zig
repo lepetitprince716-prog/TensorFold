@@ -251,6 +251,50 @@ fn monoNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
+/// TF_DS_SPILL_ASYNC: only the text 1 runs spill writes on a writer thread (unset, 0, false, off, any other text: no).
+pub fn knobOn(text: ?[]const u8) bool {
+    return std.mem.eql(u8, text orelse return false, "1");
+}
+
+/// The byte rank 0's spill_sync frame ends with when its spill writes run on a writer thread (else the frame has none).
+pub const mode_byte: u8 = 1;
+
+/// A follower's first reply byte to spill_sync: no disk tier, the same writer mode as rank 0, or another one.
+pub const Answer = enum(u8) { no_tier = 0, same = 1, differs = 2 };
+
+/// Rank 0's spill_sync frame after its header (`w`: lanes.Wire): the index's keys, then the mode byte when `on`.
+pub fn putSync(w: anytype, gpa: std.mem.Allocator, keys: []const u64, on: bool) !void {
+    try w.int(gpa, u32, @intCast(keys.len));
+    for (keys) |k| try w.int(gpa, u64, k);
+    if (on) try w.int(gpa, u8, mode_byte);
+}
+
+/// Whether rank 0's spill_sync frame ends with the mode byte (`r`: lanes.Reader past the keys; no byte left: no).
+pub fn readMode(r: anytype) bool {
+    return if (r.int(u8)) |b| b == mode_byte else |_| false;
+}
+
+/// A follower's answer to spill_sync, given whether it has a tier, its own writer mode and rank 0's.
+pub fn answer(has_tier: bool, mine: bool, theirs: bool) Answer {
+    if (!has_tier) return .no_tier;
+    return if (mine == theirs) .same else .differs;
+}
+
+/// A follower's reply to spill_sync (`w`: lanes.Wire): the answer byte, then its tier's identity (0: none).
+pub fn putAnswer(w: anytype, gpa: std.mem.Allocator, a: Answer, identity: u64) !void {
+    try w.int(gpa, u8, @intFromEnum(a));
+    try w.int(gpa, u64, identity);
+}
+
+/// Rank 0's reading of a follower's answer byte (a byte this build never sends is another mode: the safe reading).
+pub fn answerOf(byte: u8) Answer {
+    return switch (byte) {
+        0 => .no_tier,
+        1 => .same,
+        else => .differs,
+    };
+}
+
 test {
     _ = @import("spill_writer_test.zig");
 }

@@ -7,6 +7,7 @@ const prompt = @import("prompt.zig");
 const spill = @import("spill.zig");
 const link = @import("link.zig");
 const bgw = @import("spill_async.zig");
+const writer = @import("spill_writer.zig");
 const Lanes = lanes.Lanes;
 const Snap = lanes.Snap;
 const Reader = lanes.Reader;
@@ -26,7 +27,9 @@ pub const Settings = struct {
         const min = if (env("TF_DS_SPILL_MIN_TOKENS")) |v| std.fmt.parseInt(u32, v, 10) catch return error.BadSpillMin else 8192;
         const mib = if (env("TF_DS_SPILL_STAGING_MIB")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadSpillStaging else 32;
         if (gib <= 0 or mib == 0) return null;
-        const bg = if (env("TF_DS_SPILL_ASYNC")) |v| v.len > 0 and !std.mem.eql(u8, v, "0") else false;
+        const knob = env("TF_DS_SPILL_ASYNC");
+        const bg = writer.knobOn(knob);
+        if (knob) |v| std.log.info("dsv41: TF_DS_SPILL_ASYNC={s} is read as {s} (only 1 runs spill writes on a writer thread)", .{ v, onOff(bg) });
         return .{ .root = root, .cap = @intFromFloat(gib * (1 << 30)), .min_tokens = min, .staging = mib << 20, .background = bg };
     }
 
@@ -35,6 +38,10 @@ pub const Settings = struct {
     }
 };
 
+fn onOff(on: bool) []const u8 {
+    return if (on) "on" else "off";
+}
+
 /// One rank's tier: its files (spill.zig) through its pinned staging, on its model's stream.
 pub const Tier = struct {
     sp: spill.Spill,
@@ -42,6 +49,7 @@ pub const Tier = struct {
     settings: Settings,
     identity: u64,
     bg: ?*bgw.Background = null, // TF_DS_SPILL_ASYNC=1 (null: the engine thread writes, as before)
+    off: bool = false, // a follower's: the ranks differ on TF_DS_SPILL_ASYNC (spill_sync), so it answers as if it had no tier
 
     pub fn open(gpa: std.mem.Allocator, m: *model.Model, s: Settings, id: u64) !*Tier {
         const t = try gpa.create(Tier);
@@ -58,6 +66,7 @@ pub const Tier = struct {
         errdefer t.sp.deinit();
         std.log.info("dsv41: kept prompt states spill to {s} ({d} MiB a block of {d} tokens, {d} MiB a slot part)", .{ s.root, t.sp.blockBytes() >> 20, model.chunk_rows, m.snapBytes() >> 20 });
         t.bg = null;
+        t.off = false;
         if (s.background) {
             t.bg = try bgw.Background.open(gpa, m, t, s.staging);
             std.log.info("dsv41: spill writes run on a writer thread (TF_DS_SPILL_ASYNC=1)", .{});
@@ -198,23 +207,34 @@ pub fn knownFn(ptr: *anyopaque, dir: [:0]const u8, keys: []const u64) u8 {
     bgw.drain(t, ln);
     t.sp.keepOnly(keys) catch {};
     var peers = std.hash.Wyhash.init(0);
+    var differs = false;
     ln.busyStartup("spill_sync"); // waits on every follower, which may still be loading: TF_DS_WATCHDOG_START_S, not _S
     defer ln.idle();
     if (ln.begin(.spill_sync) catch return 2) {
-        ln.wire.int(ln.gpa, u32, @intCast(keys.len)) catch return 2;
-        for (keys) |k| ln.wire.int(ln.gpa, u64, k) catch return 2;
+        writer.putSync(&ln.wire, ln.gpa, keys, t.bg != null) catch return 2;
         ln.flush() catch return 2;
         for (ln.m.followers(), 1..) |l, rank| {
             var buf: [16]u8 = undefined;
             var r: Reader = .{ .b = l.?.recv(&buf) catch return 2 };
             const on = r.int(u8) catch 0;
             const id = r.int(u64) catch 0;
-            if (on == 0) {
-                std.log.err("dsv41: rank {d} has no TF_DS_SPILL_DIR: kept prompt states stay in memory", .{rank});
-                return 2;
+            switch (writer.answerOf(on)) {
+                .no_tier => {
+                    std.log.err("dsv41: rank {d} has no TF_DS_SPILL_DIR: kept prompt states stay in memory", .{rank});
+                    return 2;
+                },
+                .differs => { // (every follower's answer is read: none is left on its link)
+                    std.log.err("dsv41: TF_DS_SPILL_ASYNC differs: rank 0 {s}, rank {d} {s}; the disk tier is off on both ranks", .{ onOff(t.bg != null), rank, onOff(t.bg == null) });
+                    differs = true;
+                },
+                .same => {},
             }
             peers.update(std.mem.asBytes(&id));
         }
+    }
+    if (differs) { // the writes of one rank would race the other's rows: no disk tier is the exact outcome
+        ln.spill = null;
+        return 2;
     }
     const now = peers.final();
     var path: [1200]u8 = undefined;
@@ -260,17 +280,24 @@ pub fn load(ln: *Lanes, sn: *Snap, base: usize) !void {
 }
 
 /// A follower's spill frame (`kind`), its kept states' buffers in `kept`, answers on `peer`.
-pub fn follow(gpa: std.mem.Allocator, m: *model.Model, t: ?*Tier, kind: lanes.Kind, r: *Reader, kept: *std.AutoHashMapUnmanaged(u64, cuda.DeviceBuffer), peer: link.Link) !void {
+pub fn follow(gpa: std.mem.Allocator, m: *model.Model, tier: ?*Tier, kind: lanes.Kind, r: *Reader, kept: *std.AutoHashMapUnmanaged(u64, cuda.DeviceBuffer), peer: link.Link) !void {
+    const t: ?*Tier = if (tier) |x| (if (x.off) null else x) else null; // (a tier turned off answers as none does)
     switch (kind) {
         .spill_sync => {
             const n = try r.int(u32);
             const keys = try gpa.alloc(u64, n);
             defer gpa.free(keys);
             for (keys) |*k| k.* = try r.int(u64);
+            const theirs = writer.readMode(r);
+            const mine = if (t) |x| x.bg != null else false;
+            const say = writer.answer(t != null, mine, theirs);
             var w: lanes.Wire = .{};
             defer w.deinit(gpa);
-            try w.int(gpa, u8, @intFromBool(t != null));
-            try w.int(gpa, u64, if (t) |x| x.identity else 0);
+            try writer.putAnswer(&w, gpa, say, if (t) |x| x.identity else 0);
+            if (say == .differs) {
+                if (!@import("builtin").is_test) std.log.err("dsv41: TF_DS_SPILL_ASYNC differs: rank 0 {s}, this rank {s}; the disk tier is off on both ranks", .{ onOff(theirs), onOff(mine) });
+                tier.?.off = true;
+            }
             if (t) |x| bgw.drain(x, null);
             if (t) |x| x.sp.keepOnly(keys) catch |err| std.log.err("dsv41: spill sync: {s}", .{@errorName(err)});
             try peer.send(w.buf.items);
@@ -342,4 +369,56 @@ fn writeWord(path: [:0]const u8, w: u64) void {
     defer _ = std.c.close(fd);
     _ = std.c.write(fd, std.mem.asBytes(&w), 8);
     _ = std.c.fsync(fd);
+}
+
+/// A follower with tier `t` answers the spill_sync frame in `w` over a socket pair; the reply's bytes, in `out`.
+fn syncReply(gpa: std.mem.Allocator, t: *Tier, w: *lanes.Wire, out: []u8) ![]u8 {
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPair;
+    defer for (fds) |fd| {
+        _ = std.c.close(fd);
+    };
+    var kept: std.AutoHashMapUnmanaged(u64, cuda.DeviceBuffer) = .empty;
+    defer kept.deinit(gpa);
+    var m: *model.Model = undefined; // (a spill_sync frame never reads the model)
+    _ = &m;
+    var r: Reader = .{ .b = w.buf.items };
+    try follow(gpa, m, t, .spill_sync, &r, &kept, .{ .fd = fds[0] });
+    return (link.Link{ .fd = fds[1] }).recv(out);
+}
+
+test "spill_sync: a follower whose writer mode is rank 0's answers as it always did; one whose mode differs says so and is off" {
+    const gpa = std.testing.allocator;
+    const st = @import("spill_test.zig");
+    var d1: [128]u8 = undefined;
+    const dir = try st.scratch(&d1, "follow-sync");
+    defer st.rmDir(dir);
+    const mem = try gpa.alloc(u8, 16384);
+    defer gpa.free(mem);
+    var fake: st.Fake = .{ .mem = mem };
+    const stage = try gpa.alignedAlloc(u8, .fromByteUnits(spill.page), 2 * spill.page);
+    defer gpa.free(stage);
+    var writing: bgw.Background = .{ .w = undefined, .host = undefined, .stream = undefined, .m = undefined, .limit_ns = 0 }; // (nothing queued)
+    for ([_][2]bool{ .{ false, false }, .{ true, true }, .{ false, true }, .{ true, false } }) |modes| { // rank 0's, the follower's
+        var t: Tier = .{ .sp = try spill.Spill.init(gpa, &st.Fake.planes, 16, st.Fake.slot_bytes, fake.dev(), stage), .host = undefined, .settings = undefined, .identity = 0x1122334455667788 };
+        defer t.sp.deinit();
+        try t.sp.open(dir);
+        t.bg = if (modes[1]) &writing else null;
+        var w: lanes.Wire = .{};
+        defer w.deinit(gpa);
+        try writer.putSync(&w, gpa, &.{ 7, 9 }, modes[0]);
+        var buf: [16]u8 = undefined;
+        const reply = try syncReply(gpa, &t, &w, &buf);
+        try std.testing.expectEqual(@as(usize, 9), reply.len);
+        try std.testing.expectEqual(@as(u8, if (modes[0] == modes[1]) 1 else 2), reply[0]); // 1: the byte it always sent
+        try std.testing.expectEqual(@as(u64, 0x1122334455667788), std.mem.readInt(u64, reply[1..9], .little));
+        try std.testing.expectEqual(modes[0] != modes[1], t.off);
+        if (t.off) { // a tier turned off answers as none does
+            var again: lanes.Wire = .{};
+            defer again.deinit(gpa);
+            try writer.putSync(&again, gpa, &.{}, modes[0]);
+            const none = try syncReply(gpa, &t, &again, &buf);
+            try std.testing.expectEqual(@as(u8, 0), none[0]);
+        }
+    }
 }
