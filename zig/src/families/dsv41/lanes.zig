@@ -750,6 +750,7 @@ pub const Lanes = struct {
             try self.wire.int(self.gpa, u64, l.base);
             try self.flush();
         }
+        errdefer self.wire.refuse(); // a checked frame as fill_begin: rank 1's refusal must meet rank 0's
         try self.m.fillBegin(f.slot, l.base);
         self.fill = f;
         self.paused = null;
@@ -1623,10 +1624,10 @@ test "snap_drop, done and the spill frames neither compare nor consume an outcom
     try std.testing.expect(try g.frame(.verify, false, false) == null);
 }
 
-test "the outcome check covers the seven frames of the pair's device work and no other" {
+test "the outcome check covers the eight frames of the pair's device work and no other" {
     for (std.enums.values(Kind)) |k| {
         const want = switch (k) {
-            .fill_begin, .fill_chunk, .verify, .pass, .fill_images, .snap_save, .snap_restore => true,
+            .fill_begin, .fill_chunk, .verify, .pass, .fill_images, .snap_save, .snap_restore, .fill_resume => true,
             else => false,
         };
         try std.testing.expectEqual(want, checked(k));
@@ -1870,7 +1871,7 @@ test "only a round and a drafter pass leave the wall time between rounds unspoil
         try std.testing.expect(!try ln.begin(kind)); // (one rank: no frame)
         try std.testing.expect(!ln.pace.other);
     }
-    for ([_]Kind{ .fill_begin, .fill_chunk, .fill_images, .snap_save, .snap_restore, .snap_drop, .spill_sync, .spill_write, .spill_load, .spill_forget, .spill_wait, .done }) |kind| {
+    for ([_]Kind{ .fill_begin, .fill_chunk, .fill_images, .fill_resume, .snap_save, .snap_restore, .snap_drop, .spill_sync, .spill_write, .spill_load, .spill_forget, .spill_wait, .done }) |kind| {
         ln.pace.other = false;
         try std.testing.expect(!try ln.begin(kind));
         try std.testing.expect(ln.pace.other);
