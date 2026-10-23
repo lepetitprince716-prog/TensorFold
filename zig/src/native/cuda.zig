@@ -158,6 +158,7 @@ const Host = struct {
     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
     learned: ?api.prompt_imprint.Imprint = null, // spill mode: the kept states' index on disk
+    grid: ?[2]u32 = null, // where the family keeps them (chunk rows, tail), for the host's step-ahead pass
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -213,6 +214,13 @@ const Host = struct {
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
         if (h.cache) |*store| h.host.cache = store;
+        if (h.cache != null) if (h.grid) |g| {
+            h.host.ahead_grid = .{ .chunk = g[0], .tail = g[1] };
+        };
+        // TF_DS_STEP_AHEAD=1: a finished reply is read ahead while the client works (a family with a grid and the cache)
+        if (h.host.ahead_on) {
+            if (h.host.ahead_grid) |g| std.log.info("step-ahead: a finished reply is read ahead to its last {d}-row chunk end that leaves {d} tokens", .{ g.chunk, g.tail }) else std.log.warn("TF_DS_STEP_AHEAD=1 does nothing without the prompt cache and the family's grid", .{});
+        }
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         try h.host.start();
     }
@@ -411,6 +419,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             };
         }
     };
+    if (@hasField(@TypeOf(loaded), "grid")) h.grid = loaded.grid;
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
     const vision: ?api.Vision = if (@hasField(@TypeOf(loaded), "vision")) loaded.vision else null;
     try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision }, .{ .ctx = loaded.ctx, .text = F.explain });

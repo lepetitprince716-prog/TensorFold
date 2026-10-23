@@ -66,6 +66,9 @@ pub const Loaded = struct {
     snaps: ?Snaps = null,
     /// Images in requests (the server renders their placeholders; the tower runs on this rank).
     vision: ?lanes.stream.Vision = null,
+    /// Where the kept states sit: chunk ends of this many rows, at least the window before a prompt's end (the host's
+    /// step-ahead pass cuts its prompt there).
+    grid: ?[2]u32 = null,
 };
 
 pub const Snaps = struct {
@@ -190,7 +193,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     var snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
     if (st.tier) |t| snaps.spill = .{ .write = spill_lanes.writeFn, .read = spill_lanes.readFn, .forget = spill_lanes.forgetFn, .disk_bytes = spill_lanes.diskBytesFn, .known = spill_lanes.knownFn, .settled = if (t.bg != null) spill_async.settledFn else null, .root = t.settings.root, .cap = t.settings.cap, .min_tokens = t.settings.min_tokens, .identity = t.identity };
     st.lanes.dog = try lanes_mod.watch(gpa, io, st.m); // last: nothing after it can fail with the thread running
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .grid = .{ model.chunk_rows, @intCast(st.m.cfg.window) } };
 }
 
 fn deinitFn(ptr: *anyopaque) void {

@@ -1634,6 +1634,56 @@ test "the outcome check covers the eight frames of the pair's device work and no
     }
 }
 
+test "a pass cancelled at a chunk end (a step-ahead pass an arrival does not continue) sends and refuses nothing: the ranks agree" {
+    const gpa = std.testing.allocator;
+    var m: Model = undefined;
+    m.io = std.testing.io;
+    m.ahead = null;
+    m.fill_seq = &.{};
+    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = .{ .fd = -1 } };
+    defer ln.wire.deinit(gpa);
+    defer ln.streams.deinit(gpa);
+    defer ln.seqs[0].deinit(gpa);
+    const Gone = struct {
+        fn check(_: *anyopaque) bool {
+            return true; // the arrival's cancel is in the host's list
+        }
+    };
+    var unused: u8 = 0;
+    const prompt = try gpa.alloc(u32, 2 * model.chunk_rows + 128);
+    defer gpa.free(prompt);
+    @memset(prompt, 1);
+    var s = try lanes.Stream.init(gpa, .{ .id = "t", .prompt = prompt, .max_new = 1, .sampling = null, .drafts = false, .cancel_check = .{ .ptr = &unused, .check = Gone.check } });
+    defer s.deinit(gpa);
+    try ln.seqs[0].resize(gpa, prompt.len);
+    ln.step = 2;
+    // rank 0 sent fill_begin (step 0) and the first chunk's fill_chunk (step 1); both ranks ran them done
+    var check: Check = .{};
+    var why: [96]u8 = undefined;
+    for ([_]Kind{ .fill_begin, .fill_chunk }, 0..) |kind, step| try std.testing.expect(check.frame(&why, kind, step, outcome_done) == null);
+    for ([_]bool{ true, false }) |in_piece| {
+        try ln.streams.put(gpa, &s, .{ .slot = 0, .base = 0, .end = 3 * model.chunk_rows });
+        ln.used[0] = true;
+        ln.fill = .{ .s = &s, .slot = 0, .len = prompt.len, .replay = prompt.len - 128, .last_end = 2 * model.chunk_rows, .start = model.chunk_rows };
+        if (in_piece) { // its next chunk sees the cancel before its frame
+            try std.testing.expectError(error.Cancelled, ln.prefillPart(&s, 1));
+            try std.testing.expect(ln.fill == null);
+        }
+        // in a piece (core.piece) or between two (takeCancels: core.discard), the host's release frees its slot
+        Lanes.releaseFn(&ln, &s);
+        try std.testing.expect(ln.fill == null and ln.paused == null and !ln.used[0] and ln.streams.count() == 0);
+        try std.testing.expectEqual(@as(u64, 2), ln.step); // no frame
+        try std.testing.expectEqual(@as(usize, 0), ln.wire.buf.items.len);
+        try std.testing.expectEqual(outcome_done, ln.wire.outcome); // no refusal for the next frame to carry
+    }
+    // the next request's pass: its fill_begin carries rank 0's done, which rank 1's done meets
+    try std.testing.expect(try ln.begin(.fill_begin));
+    var r: Reader = .{ .b = ln.wire.buf.items };
+    const h = try header(&r);
+    try std.testing.expectEqual(@as(u64, 2), h.step);
+    try std.testing.expect(check.frame(&why, h.kind, h.step, h.outcome) == null);
+}
+
 test "the pair_broken line is one JSON object, whatever the reason's text" {
     var buf: [96]u8 = undefined;
     try std.testing.expectEqualStrings("{\"pair_broken\": \"step 3: rank 0 done, rank 1 refused\"}\n", jsonLine(&buf, "pair_broken", "step 3: rank 0 done, rank 1 refused"));
