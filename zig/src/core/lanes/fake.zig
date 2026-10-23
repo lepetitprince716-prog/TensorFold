@@ -125,6 +125,15 @@ pub const Fake = struct {
     fn pieces(x: *Fake, s: *Stream, chunks: usize) !bool {
         const l = x.lanes.getPtr(s).?;
         const total = if (x.prefill_chunks == 0) 1 else x.prefill_chunks;
+        const h = &l.history;
+        if (l.pieces == 0) { // restored before the first chunk, as a backend's own pass does (the host then lets go of it)
+            s.cached = 0;
+            if (s.reuse.saved) |saved| { // the kept state's tokens stand in for the prompt's first `at`
+                const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
+                try h.appendSlice(x.gpa, kept.items);
+                s.cached = s.reuse.at;
+            }
+        }
         var ran: usize = 0;
         while (l.pieces < total and ran < chunks) : (ran += 1) {
             x.prefill_count += 1;
@@ -133,13 +142,6 @@ pub const Fake = struct {
             if (s.isCancelled()) return error.Cancelled;
         }
         if (l.pieces < total) return false;
-        const h = &l.history;
-        s.cached = 0;
-        if (s.reuse.saved) |saved| { // the kept state's tokens stand in for the prompt's first `at`
-            const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
-            try h.appendSlice(x.gpa, kept.items);
-            s.cached = s.reuse.at;
-        }
         for (s.prompt()[h.items.len..], h.items.len + 1..) |t, at| {
             try h.append(x.gpa, t);
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
