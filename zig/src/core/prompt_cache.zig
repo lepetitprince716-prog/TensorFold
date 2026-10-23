@@ -68,6 +68,7 @@ pub const Entry = struct {
     used: u64, // the store's clock at its last keep or resume
     last: []u32, // the last prompt that kept or resumed it
     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
+    provisional: bool = false, // kept ahead of the client (step-ahead) and not resumed since: evicted first, supersedes nothing
 };
 
 pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
@@ -169,8 +170,14 @@ pub const Store = struct {
 
     /// begin without the restore, for backends that restore inside their own prompt pass and then call `resumed`.
     pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32) !Lookup {
+        return s.lookupOn(a, prompt, history_len, shared, starts, true);
+    }
+
+    /// lookup; a longer learned state read back from disk only when `disk` (a step-ahead pass waits on no read).
+    pub fn lookupOn(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, disk: bool) !Lookup {
         s.settle(false);
-        const e = s.recall(prompt, starts, s.find(prompt, starts));
+        const found = s.find(prompt, starts);
+        const e = if (disk) s.recall(prompt, starts, found) else found;
         if (e == null) s.counts.misses += 1;
         const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
         for (shared) |w| { // the shared cuts this pass keeps: their states serve other conversations too
@@ -234,6 +241,7 @@ pub const Store = struct {
         }
         s.clock += 1;
         e.used = s.clock;
+        e.provisional = false;
         s.counts.hits += 1;
         const last = s.gpa.dupe(u32, prompt) catch return;
         s.gpa.free(e.last);
@@ -270,6 +278,15 @@ pub const Store = struct {
 
     /// The prompt pass stands at `at`: keep its state for `prompt`, evicting to fit; refused (counted) past the budget.
     pub fn keep(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32) bool {
+        return s.keepBut(prompt, at, owner, starts, null, false);
+    }
+
+    /// A step-ahead pass's keep: provisional until a request resumes it, and never evicting `from`, the state it resumed.
+    pub fn keepAhead(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32, from: ?*Entry) bool {
+        return s.keepBut(prompt, at, owner, starts, from, true);
+    }
+
+    fn keepBut(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32, skip: ?*Entry, provisional: bool) bool {
         const n = @as(usize, at) + s.rules.lookahead;
         if (at == 0 or n > prompt.len) return false;
         s.clock += 1;
@@ -277,6 +294,7 @@ pub const Store = struct {
         for (s.entries.items) |e| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n])) {
             e.used = s.clock; // the same state again: no copy
             e.shared = e.shared or shared;
+            e.provisional = e.provisional and provisional;
             return true;
         };
         const bytes = s.family.vtable.bytes(s.family.ptr, at);
@@ -293,7 +311,10 @@ pub const Store = struct {
                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
             }
-            s.remove(s.victimBut(null, prompt).?); // its storage may come back spare and take this state
+            s.remove(s.victimBut(skip, prompt) orelse { // only `skip` is left: it stays, and this state is not kept
+                s.counts.refused += 1;
+                return false;
+            }); // its storage may come back spare and take this state
             s.counts.evicted += 1;
         }
         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
@@ -314,7 +335,7 @@ pub const Store = struct {
             return s.fail(at, err);
         };
         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
-        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared };
+        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .provisional = provisional };
         s.entries.append(s.gpa, e) catch {
             s.free(e);
             return s.fail(at, error.OutOfMemory);
@@ -475,14 +496,19 @@ pub const Store = struct {
         return false;
     }
 
-    /// The entry to free first, never `skip` (a pass's resume): one a later prompt extends (never a shared cut), oldest first; else the oldest.
+    /// The entry to free first, never `skip` (a pass's resume): a provisional one, then one a later prompt extends (never
+    /// a shared cut), oldest first; else the oldest.
     fn victimBut(s: *const Store, skip: ?*Entry, prompt: []const u32) ?usize {
         var best: ?usize = null;
+        for (s.entries.items, 0..) |e, i| if (e.provisional and e != skip and (best == null or e.used < s.entries.items[best.?].used)) {
+            best = i;
+        };
+        if (best) |i| return i;
         for (s.entries.items, 0..) |e, i| {
             if (e.shared or e == skip) continue; // a shared cut is evicted only as the least recently used
             const now = prompt.len > e.born and prompt.len > e.tokens.len and std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens); // this prompt extends it
-            const moved_on = now or for (s.entries.items) |o| {
-                if (o != e and o.born > e.born and o.tokens.len > e.tokens.len and std.mem.eql(u32, o.tokens[0..e.tokens.len], e.tokens)) break true;
+            const moved_on = now or for (s.entries.items) |o| { // (a provisional state is no sign its conversation moved on)
+                if (o != e and !o.provisional and o.born > e.born and o.tokens.len > e.tokens.len and std.mem.eql(u32, o.tokens[0..e.tokens.len], e.tokens)) break true;
             } else false;
             if (moved_on and (best == null or e.used < s.entries.items[best.?].used)) best = i;
         }

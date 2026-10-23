@@ -41,6 +41,8 @@ pub const Fake = struct {
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
     refuse_full: usize = 0, // prefill refuses this many times with error.ContextFull while another lane is live
+    cancel_before: bool = false, // the cancel is checked before each chunk past the first, as dsv41's pass does (else after each)
+    cancel_stops: usize = 0, // passes this fake ended at a cancel check (not those the host discarded between pieces)
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
@@ -136,10 +138,11 @@ pub const Fake = struct {
         }
         var ran: usize = 0;
         while (l.pieces < total and ran < chunks) : (ran += 1) {
+            if (x.cancel_before and l.pieces > 0 and s.isCancelled()) return x.stopped();
             x.prefill_count += 1;
             if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, l.pieces);
             l.pieces += 1;
-            if (s.isCancelled()) return error.Cancelled;
+            if (!x.cancel_before and s.isCancelled()) return x.stopped();
         }
         if (l.pieces < total) return false;
         for (s.prompt()[h.items.len..], h.items.len + 1..) |t, at| {
@@ -147,6 +150,11 @@ pub const Fake = struct {
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
         }
         return true;
+    }
+
+    fn stopped(x: *Fake) error{Cancelled} {
+        x.cancel_stops += 1;
+        return error.Cancelled;
     }
 
     /// A copy of the stream's cache at `at` tokens (the prompt pass stands there), for core/prompt_cache.zig.

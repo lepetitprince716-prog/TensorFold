@@ -70,7 +70,9 @@ pub const LaneHost = struct {
 
     /// Where a family keeps prompt states: chunk ends of `chunk` rows, at least `tail` tokens before a prompt's end.
     pub const Grid = struct { chunk: u32, tail: u32 };
-    pub const AheadCounts = struct { queued: u64 = 0, dropped: u64 = 0, cancelled: u64 = 0, ran: u64 = 0, tokens: u64 = 0 };
+    /// Written under the lock: passes queued, dropped before they started, cancelled, run to their end, the tokens they
+    /// read, and their states a later request resumed.
+    pub const AheadCounts = struct { queued: u64 = 0, dropped: u64 = 0, cancelled: u64 = 0, ran: u64 = 0, tokens: u64 = 0, resumed: u64 = 0 };
     const ahead_id_base: Id = 1 << 63; // step-ahead jobs' ids, apart from the server's
 
     const Mark = struct { at: i96, tokens: u64 };
@@ -96,27 +98,41 @@ pub const LaneHost = struct {
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
         kept0: u64 = 0, // the store's kept count when the job looked it up
         warm: ?*Warm = null, // a step-ahead pass: its own request and tokens, freed with the job
+        from: ?*pc.Entry = null, // a step-ahead pass: the state it resumed, which its keeps never evict (compared only)
 
         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
-            if (job.host.cache) |store| _ = store.keep(job.request.cacheKey(), at, s, job.request.chunks); // an image span keyed by its digest
+            const store = job.host.cache orelse return;
+            if (job.warm != null) _ = store.keepAhead(job.request.cacheKey(), at, s, job.request.chunks, job.from) else _ = store.keep(job.request.cacheKey(), at, s, job.request.chunks); // an image span keyed by its digest
         }
 
-        /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
+        /// Report a restored prefix or its failed copy; an untouched prefix remains kept. A step-ahead pass leaves the
+        /// state it resumed as it was (its use, its last prompt): only the client's own requests move it.
         fn reported(job: *Job) void {
             const e = job.entry orelse return;
             job.entry = null;
             const store = job.host.cache orelse return;
             if (!job.started) return;
             job.stream.reuse.saved = null; // the backend restores before its first chunk; a later keep may free it
-            if (job.stream.reuse_failed) store.resumed(e, job.request.cacheKey(), false) else if (job.stream.cached == e.at) store.resumed(e, job.request.cacheKey(), true);
+            if (job.stream.reuse_failed) return store.resumed(e, job.request.cacheKey(), false);
+            if (job.stream.cached != e.at) return;
+            if (job.warm != null) {
+                job.from = e;
+                return;
+            }
+            if (e.provisional) {
+                job.host.lock();
+                job.host.ahead_counts.resumed += 1;
+                job.host.unlock();
+            }
+            store.resumed(e, job.request.cacheKey(), true);
         }
     };
 
-    /// A step-ahead pass's request (prompt ++ reply up to its tail past the kept point, one token) and what it resumes.
-    const Warm = struct { request: Request, tokens: []u32, from: u32, at: u32 };
+    /// A step-ahead pass's request (prompt ++ reply up to its tail past the kept point, one token) and that point.
+    const Warm = struct { request: Request, tokens: []u32, at: u32 };
 
     /// A step-ahead pass reports to no one.
     fn quiet(_: *anyopaque, _: Id, _: *const Event) void {}
@@ -297,13 +313,13 @@ pub const LaneHost = struct {
         if (r.images.len > 0 or r.cache_key.len != 0 or r.prompt.len < store.rules.min_prompt) return null;
         const seq = job.stream.context.items; // prompt ++ reply: the next step's prompt starts so
         if (seq.len < @as(usize, g.chunk) + g.tail) return null;
-        const at = (seq.len - g.tail) / g.chunk * g.chunk;
-        const from: usize = if (store.find(seq[0 .. at + g.tail], &.{})) |e| e.at else 0;
-        if (at <= from) return null;
         h.lock();
         const busy = h.closing or h.queued.items.len > 0 or h.admitted.items.len > 1;
         h.unlock();
         if (busy) return null;
+        const at = (seq.len - g.tail) / g.chunk * g.chunk;
+        const from: usize = if (store.find(seq[0 .. at + g.tail], &.{})) |e| e.at else 0;
+        if (at <= from) return null;
         const w = h.gpa.create(Warm) catch return null;
         const tokens = h.gpa.dupe(u32, seq[0 .. at + g.tail]) catch {
             h.gpa.destroy(w);
@@ -311,7 +327,7 @@ pub const LaneHost = struct {
         };
         // one token, no drafts (the pass is all it is for), its history mark the kept point; nothing of the
         // reply's request (its slices go with it) beyond its sampling, a value
-        w.* = .{ .tokens = tokens, .from = @intCast(from), .at = @intCast(at), .request = .{ .prompt = tokens, .max_tokens = 1, .sampling = r.sampling, .drafts = false, .background = true, .history_len = @intCast(at) } };
+        w.* = .{ .tokens = tokens, .at = @intCast(at), .request = .{ .prompt = tokens, .max_tokens = 1, .sampling = r.sampling, .drafts = false, .background = true, .history_len = @intCast(at) } };
         const wj = h.gpa.create(Job) catch {
             h.gpa.free(tokens);
             h.gpa.destroy(w);
@@ -337,23 +353,23 @@ pub const LaneHost = struct {
     }
 
     fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
-        if (job.warm != null) {
-            h.lock();
-            if (h.ahead_running == job) h.ahead_running = null;
-            h.unlock();
-        }
         job.reported();
         h.gpa.free(job.marks);
         const s = &job.stream;
         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
-        if (job.warm) |w| if (job.started) { // (counted before its finished event: a sink that heard it reads them)
-            if (reason == .cancelled) h.ahead_counts.cancelled += 1;
-            if (job.prefilled) |done| if (reason == .stop or reason == .length) {
+        if (job.warm) |w| { // (counted before its finished event: a sink that heard it reads them)
+            h.lock();
+            if (h.ahead_running == job) h.ahead_running = null;
+            const ran = job.started and job.prefilled != null and (reason == .stop or reason == .length);
+            if (job.started and reason == .cancelled) h.ahead_counts.cancelled += 1;
+            if (ran) {
                 h.ahead_counts.ran += 1;
                 h.ahead_counts.tokens += w.at -| s.cached;
-                if (!@import("builtin").is_test) std.log.info("step-ahead: kept {d} tokens, read {d} after {d} in {d} ms ({d} passes, {d} yielded, {d} cancelled)", .{ w.at, w.at -| s.cached, s.cached, @divTrunc(done - job.began, std.time.ns_per_ms), h.ahead_counts.ran, h.ahead_counts.dropped, h.ahead_counts.cancelled });
-            };
-        };
+            }
+            const n = h.ahead_counts;
+            h.unlock();
+            if (ran and !@import("builtin").is_test) std.log.info("step-ahead: kept {d} tokens, read {d} after {d} in {d} ms ({d} passes, {d} resumed, {d} yielded, {d} cancelled)", .{ w.at, w.at -| s.cached, s.cached, @divTrunc(job.prefilled.? - job.began, std.time.ns_per_ms), n.ran, n.resumed, n.dropped, n.cancelled });
+        }
         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
         if (job.started) {
             s.deinit(h.gpa);
@@ -468,10 +484,18 @@ pub const LaneHost = struct {
         };
         if (job.warm != null) h.ahead_running = job;
         h.unlock();
+        // a step-ahead pass an arrival cancelled meanwhile goes before its lookup evicts room or its stream starts
+        if (job.warm != null and cancelled(job)) {
+            h.lock();
+            h.ahead_counts.cancelled += 1;
+            h.unlock();
+            return h.cancel(job);
+        }
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
-        // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        if (h.cache) |store| if (store.lookup(h.gpa, r.cacheKey(), r.history_len, r.shared_prefixes, r.chunks)) |l| {
+        // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass;
+        // a step-ahead pass reads no learned state from disk (an arrival would wait on the read)
+        if (h.cache) |store| if (store.lookupOn(h.gpa, r.cacheKey(), r.history_len, r.shared_prefixes, r.chunks, job.warm == null)) |l| {
             job.entry = l.entry;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
@@ -503,6 +527,7 @@ pub const LaneHost = struct {
         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
         job.began = began;
         if (h.loneFits(job)) return h.runLone(job, began);
+        if (job.warm != null and cancelled(job)) return h.cancel(job); // (counted as it finishes: it started)
         h.core.addStream(&job.stream) catch |e| {
             if (e == error.Cancelled) return h.cancel(job);
             // a pass in pieces holds room as the active streams do: a cut-in refused for room waits, as it would without cut_in

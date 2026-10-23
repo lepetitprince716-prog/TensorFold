@@ -295,15 +295,32 @@ test "a prompt with an image resumes when its image is the same, and not past th
     try std.testing.expectEqual(@as(?u32, 0), b3.cached);
 }
 
-/// A fake snapshot vtable over lanes.fake.Fake (states at any position) and a sink that records one reply.
+/// A fake snapshot vtable over lanes.fake.Fake (states at any position), a sink that records one reply, and step 1 of
+/// every step-ahead test on the production tail (DeepSeek's 128-row window) and a 16-row grid.
 const AheadKit = struct {
+    /// Step 1's prompt (160 tokens), kept at its history 32 (a chunk end the tail before its end, as dsv41 keeps); its
+    /// 144 reply tokens make 304, so the pass keeps at 176 (304 - 128 down to 16s), 16 tokens into the reply.
+    const t1 = blk: {
+        var a: [160]u32 = undefined;
+        for (&a, 0..) |*x, i| x.* = @intCast((i * 31 + 3) % 97);
+        break :blk a;
+    };
+    const history = 32;
+    const reply = 144;
+    const at = 176;
+    const warm_len = 304;
+    const grid: LaneHost.Grid = .{ .chunk = 16, .tail = 128 };
+    // (min_gap 32: the stable mark at step 1's prompt end, 160, is no state of its own next to 176, as on dsv41, where
+    // it floors onto a kept point)
+    const rules: pc.Rules = .{ .min_gap = 32, .min_prompt = 0, .tail = 128 };
+
     const Snaps = struct {
-        fn bytes(_: *anyopaque, at: u32) u64 {
-            return 64 + 4 * @as(u64, at);
+        fn bytes(_: *anyopaque, n: u32) u64 {
+            return 64 + 4 * @as(u64, n);
         }
-        fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
+        fn save(ptr: *anyopaque, owner: ?*anyopaque, n: u32) anyerror!pc.Saved {
             const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
-            return f.save(@ptrCast(@alignCast(owner.?)), at);
+            return f.save(@ptrCast(@alignCast(owner.?)), n);
         }
         fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
             return error.BackendRestores;
@@ -313,6 +330,8 @@ const AheadKit = struct {
             f.drop(saved);
         }
     };
+    const vtable: pc.Snapshots.VTable = .{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop };
+
     const Box = struct {
         mutex: std.Io.Mutex = .init,
         tokens: std.ArrayList(u32) = .empty,
@@ -338,6 +357,42 @@ const AheadKit = struct {
             }
         }
     };
+
+    const r1: Request = .{ .prompt = &t1, .max_tokens = reply, .history_len = history };
+
+    /// The next step: step 1's prompt, its reply as the client sends it back (the first token changed when `changed`),
+    /// a tool result (308 tokens). The caller frees it.
+    fn next(gpa: std.mem.Allocator, got: []const u32, changed: bool) ![]u32 {
+        var p: std.ArrayList(u32) = .empty;
+        errdefer p.deinit(gpa);
+        try p.appendSlice(gpa, &t1);
+        try p.appendSlice(gpa, got);
+        if (changed) p.items[t1.len] = (p.items[t1.len] + 1) % lanes.fake.vocab;
+        try p.appendSlice(gpa, &.{ 7, 7, 5, 3 });
+        return p.toOwnedSlice(gpa);
+    }
+
+    fn expectFake(prompt: []const u32, got: []const u32) !void {
+        var h: std.ArrayList(u32) = .empty;
+        defer h.deinit(std.testing.allocator);
+        try h.appendSlice(std.testing.allocator, prompt);
+        for (got) |t| {
+            try std.testing.expectEqual(lanes.fake.next(h.items, null, h.items.len), t);
+            try h.append(std.testing.allocator, t);
+        }
+    }
+
+    /// The store's entry at `n` tokens that is a prefix of `prompt`.
+    fn entry(store: *pc.Store, prompt: []const u32, n: u32) ?*pc.Entry {
+        for (store.entries.items) |e| if (e.at == n and std.mem.startsWith(u32, prompt, e.tokens)) return e;
+        return null;
+    }
+
+    fn counts(host: *LaneHost) LaneHost.AheadCounts {
+        host.mutex.lockUncancelable(std.testing.io);
+        defer host.mutex.unlock(std.testing.io);
+        return host.ahead_counts;
+    }
 };
 
 test "step-ahead: a reply's own tokens are read while the client works, and its next step resumes past them with the same tokens" {
@@ -349,51 +404,40 @@ test "step-ahead: a reply's own tokens are read while the client works, and its 
     var clock: lanes.fake.FixedClock = .{};
     var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
     defer core.deinit();
-    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = AheadKit.Snaps.bytes, .save = AheadKit.Snaps.save, .restore = AheadKit.Snaps.restore, .drop = AheadKit.Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
+    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &AheadKit.vtable }, AheadKit.rules, 1 << 20);
     defer store.deinit();
     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
     host.cache = &store;
     host.ahead_on = true;
-    host.ahead_grid = .{ .chunk = 4, .tail = 2 };
+    host.ahead_grid = AheadKit.grid;
     var warm: AheadKit.Box = .{};
     defer warm.tokens.deinit(gpa);
     host.ahead_sink = .{ .ctx = &warm, .event = AheadKit.Box.event };
     try host.start();
     defer host.stop();
     const e = host.engine();
-    // step 1: a 10-token prompt kept at its history (8); the reply's 6 tokens make 16, so the pass keeps 12 (16 - 2 down to 4s)
-    const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
     var b1: AheadKit.Box = .{};
     defer b1.tokens.deinit(gpa);
-    const r1: Request = .{ .prompt = &t1, .max_tokens = 6, .history_len = 8 };
-    try e.submit(1, &r1, .{ .ctx = &b1, .event = AheadKit.Box.event });
+    try e.submit(1, &AheadKit.r1, .{ .ctx = &b1, .event = AheadKit.Box.event });
     try std.testing.expectEqual(Reason.length, b1.wait());
     try std.testing.expectEqual(@as(?u32, 0), b1.cached);
-    // the step-ahead pass: one token past a pass that resumed at 8
+    // the step-ahead pass: one token past a pass that resumed at 32, its state at 176 provisional
     try std.testing.expectEqual(Reason.length, warm.wait());
-    try std.testing.expectEqual(@as(?u32, 8), warm.cached);
-    var found = false;
-    for (store.entries.items) |x| found = found or x.at == 12;
-    try std.testing.expect(found);
-    // step 2: the history, the whole reply, a tool result: resumes at 12, not 8, and reads the history exactly
-    var t2: std.ArrayList(u32) = .empty;
-    defer t2.deinit(gpa);
-    try t2.appendSlice(gpa, &t1);
-    try t2.appendSlice(gpa, b1.tokens.items);
-    try t2.appendSlice(gpa, &.{ 7, 7, 5, 3 });
+    try std.testing.expectEqual(@as(?u32, AheadKit.history), warm.cached);
+    const t2 = try AheadKit.next(gpa, b1.tokens.items, false);
+    defer gpa.free(t2);
+    const kept = AheadKit.entry(&store, t2, AheadKit.at) orelse return error.NotKept;
+    try std.testing.expect(kept.provisional);
+    try std.testing.expect(!AheadKit.entry(&store, t2, AheadKit.history).?.provisional);
+    // step 2: the history, the whole reply, a tool result: resumes at 176, not 32, and reads the history exactly
     var b2: AheadKit.Box = .{};
     defer b2.tokens.deinit(gpa);
-    const r2: Request = .{ .prompt = t2.items, .max_tokens = 12, .history_len = @intCast(t2.items.len - 2), .drafts = true };
+    const r2: Request = .{ .prompt = t2, .max_tokens = 12, .history_len = @intCast(t2.len - 2), .drafts = true };
     try e.submit(2, &r2, .{ .ctx = &b2, .event = AheadKit.Box.event });
     try std.testing.expectEqual(Reason.length, b2.wait());
-    try std.testing.expectEqual(@as(?u32, 12), b2.cached);
-    var history: std.ArrayList(u32) = .empty;
-    defer history.deinit(gpa);
-    try history.appendSlice(gpa, t2.items);
-    for (b2.tokens.items) |t| {
-        try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
-        try history.append(gpa, t);
-    }
+    try std.testing.expectEqual(@as(?u32, AheadKit.at), b2.cached);
+    try AheadKit.expectFake(t2, b2.tokens.items);
+    try std.testing.expectEqual(@as(u64, 1), AheadKit.counts(&host).resumed);
 }
 
 test "step-ahead: nothing runs when off, or when the reply moves no kept state a chunk on" {
@@ -406,82 +450,44 @@ test "step-ahead: nothing runs when off, or when the reply moves no kept state a
         var clock: lanes.fake.FixedClock = .{};
         var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
         defer core.deinit();
-        var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = AheadKit.Snaps.bytes, .save = AheadKit.Snaps.save, .restore = AheadKit.Snaps.restore, .drop = AheadKit.Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
+        var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &AheadKit.vtable }, AheadKit.rules, 1 << 20);
         defer store.deinit();
         var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
         host.cache = &store;
         host.ahead_on = on;
-        // with the grid's 8-row chunks, 10 + 2 tokens reach no chunk end past the kept 8: no pass when on either
-        host.ahead_grid = .{ .chunk = 8, .tail = 2 };
+        // 160 + 2 tokens, less the tail, reach no chunk end past the kept 32: no pass when on either
+        host.ahead_grid = AheadKit.grid;
         try host.start();
         const e = host.engine();
-        const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
         var b1: AheadKit.Box = .{};
         defer b1.tokens.deinit(gpa);
-        const r1: Request = .{ .prompt = &t1, .max_tokens = 2, .history_len = 8 };
+        const r1: Request = .{ .prompt = &AheadKit.t1, .max_tokens = 2, .history_len = AheadKit.history };
         try e.submit(1, &r1, .{ .ctx = &b1, .event = AheadKit.Box.event });
         try std.testing.expectEqual(Reason.length, b1.wait());
         host.stop();
         try std.testing.expectEqual(@as(u64, 0), host.ahead_counts.queued);
+        try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
     }
 }
 
-/// A step-ahead pass in pieces with cut-in on (TF_FILL_CHUNKS=1, TF_FILL_CUT_IN), held at its first chunk until a
-/// second request is in the queue: the chunks in the order they ran, each request's reply and where it resumed.
-const AheadCut = struct {
-    mutex: std.Io.Mutex = .init,
-    order: std.ArrayList([2]usize) = .empty, // (prompt length, chunk) as the fake ran them
-    first: bool = false, // the step-ahead pass's first chunk runs
-    sent: bool = false, // the second request is queued
-
-    const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
-    const warm_len = 14; // 10 + 6 reply tokens, cut at 12, its tail of 2
-
-    fn hook(ctx: *anyopaque, s: *lanes.stream.Stream, chunk: usize) void {
-        const w: *AheadCut = @ptrCast(@alignCast(ctx));
-        w.mutex.lockUncancelable(std.testing.io);
-        w.order.append(std.testing.allocator, .{ s.prompt_len, chunk }) catch {};
-        const hold = s.prompt_len == warm_len and chunk == 0;
-        if (hold) w.first = true;
-        w.mutex.unlock(std.testing.io);
-        if (hold) w.until(.sent) catch {};
-    }
-
-    fn until(w: *AheadCut, comptime what: enum { first, sent }) !void {
-        for (0..20000) |_| {
-            w.mutex.lockUncancelable(std.testing.io);
-            const ok = if (what == .first) w.first else w.sent;
-            w.mutex.unlock(std.testing.io);
-            if (ok) return;
-            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
-        }
-        return error.Timeout;
-    }
-
-    const Result = struct { order: [][2]usize, warm: Reason, cached: ?u32, counts: LaneHost.AheadCounts, lanes_left: usize };
-
-    /// Step 1 (t1, 6 tokens), its step-ahead pass held at chunk 0, then `second` (built from step 1's reply) and,
-    /// once it ended, `third` if any; every reply checked as the fake's. The caller frees `order`.
-    fn run(comptime second: fn (gpa: std.mem.Allocator, reply: []const u32) anyerror![]u32, third: bool) !Result {
-        const gpa = std.testing.allocator;
+test "step-ahead: a reply the client sends back changed resumes where it would without the pass, and the pass's state goes first" {
+    const gpa = std.testing.allocator;
+    var got: [2]?u32 = undefined;
+    for ([_]bool{ false, true }, 0..) |on, k| {
         var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
         defer cfg.deinit(gpa);
-        var w: AheadCut = .{};
-        errdefer w.order.deinit(gpa);
-        var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 6, .prefill_hook = hook, .prefill_hook_ctx = &w };
+        var target: lanes.fake.Fake = .{ .gpa = gpa };
         defer target.deinit();
         var clock: lanes.fake.FixedClock = .{};
         var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
         defer core.deinit();
-        core.fill_chunks = 1;
-        core.fill_rounds = 2;
-        core.cut_in = 64; // every request below is short enough to cut in
-        var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = AheadKit.Snaps.bytes, .save = AheadKit.Snaps.save, .restore = AheadKit.Snaps.restore, .drop = AheadKit.Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
+        // room for step 1's state at 32 (192 bytes) and the pass's at 176 (768), not for one more of 192
+        var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &AheadKit.vtable }, AheadKit.rules, 1100);
         defer store.deinit();
         var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
         host.cache = &store;
-        host.ahead_on = true;
-        host.ahead_grid = .{ .chunk = 4, .tail = 2 };
+        host.ahead_on = on;
+        host.ahead_grid = AheadKit.grid;
         var warm: AheadKit.Box = .{};
         defer warm.tokens.deinit(gpa);
         host.ahead_sink = .{ .ctx = &warm, .event = AheadKit.Box.event };
@@ -491,58 +497,144 @@ const AheadCut = struct {
         const e = host.engine();
         var b1: AheadKit.Box = .{};
         defer b1.tokens.deinit(gpa);
-        const r1: Request = .{ .prompt = &t1, .max_tokens = 6, .history_len = 8 };
-        try e.submit(1, &r1, .{ .ctx = &b1, .event = AheadKit.Box.event });
+        try e.submit(1, &AheadKit.r1, .{ .ctx = &b1, .event = AheadKit.Box.event });
         try std.testing.expectEqual(Reason.length, b1.wait());
-        try w.until(.first);
+        const sent = try AheadKit.next(gpa, b1.tokens.items, false); // as generated: what the pass read
+        defer gpa.free(sent);
+        if (on) {
+            try std.testing.expectEqual(Reason.length, warm.wait());
+            try std.testing.expect(AheadKit.entry(&store, sent, AheadKit.at).?.provisional);
+        }
+        // another conversation keeps a state: the budget evicts one, the pass's (it extends step 1's state, which
+        // would have gone first as superseded)
+        var q: [40]u32 = undefined;
+        for (&q, 0..) |*x, i| x.* = @intCast((i * 13 + 5) % 97);
+        var bq: AheadKit.Box = .{};
+        defer bq.tokens.deinit(gpa);
+        const rq: Request = .{ .prompt = &q, .max_tokens = 2, .history_len = AheadKit.history };
+        try e.submit(2, &rq, .{ .ctx = &bq, .event = AheadKit.Box.event });
+        try std.testing.expectEqual(Reason.length, bq.wait());
+        try std.testing.expect(AheadKit.entry(&store, sent, AheadKit.history) != null);
+        try std.testing.expect(AheadKit.entry(&store, sent, AheadKit.at) == null);
+        try std.testing.expectEqual(@as(u64, if (on) 1 else 0), store.counts.evicted);
+        // the client sends step 1's reply back with its first token changed (re-rendered): no use for the pass's state
+        const p2 = try AheadKit.next(gpa, b1.tokens.items, true);
+        defer gpa.free(p2);
+        var b2: AheadKit.Box = .{};
+        defer b2.tokens.deinit(gpa);
+        const r2: Request = .{ .prompt = p2, .max_tokens = 4, .history_len = AheadKit.at };
+        try e.submit(3, &r2, .{ .ctx = &b2, .event = AheadKit.Box.event });
+        try std.testing.expectEqual(Reason.length, b2.wait());
+        try AheadKit.expectFake(p2, b2.tokens.items);
+        got[k] = b2.cached;
+        host.stop();
+        stopped = true;
+        try std.testing.expectEqual(@as(u64, if (on) 1 else 0), host.ahead_counts.ran);
+        try std.testing.expectEqual(@as(u64, 0), host.ahead_counts.resumed);
+    }
+    try std.testing.expectEqual(@as(?u32, AheadKit.history), got[0]);
+    try std.testing.expectEqual(got[0], got[1]);
+}
+
+/// A step-ahead pass in pieces with cut-in on (TF_FILL_CHUNKS=1, TF_FILL_CUT_IN), the fake checking the cancel before
+/// each chunk past the first as dsv41 does, held in its second chunk (its second piece, run between rounds) until a
+/// second request is in the queue: the chunks in the order they ran, each request's reply and where it resumed.
+const AheadCut = struct {
+    mutex: std.Io.Mutex = .init,
+    order: std.ArrayList([2]usize) = .empty, // (prompt length, chunk) as the fake ran them
+    held: bool = false, // the step-ahead pass's second chunk runs
+    sent: bool = false, // the second request is queued
+
+    fn hook(ctx: *anyopaque, s: *lanes.stream.Stream, chunk: usize) void {
+        const w: *AheadCut = @ptrCast(@alignCast(ctx));
+        w.mutex.lockUncancelable(std.testing.io);
+        w.order.append(std.testing.allocator, .{ s.prompt_len, chunk }) catch {};
+        const hold = s.prompt_len == AheadKit.warm_len and chunk == 1;
+        if (hold) w.held = true;
+        w.mutex.unlock(std.testing.io);
+        if (hold) w.until(.sent) catch {};
+    }
+
+    fn until(w: *AheadCut, comptime what: enum { held, sent }) !void {
+        for (0..20000) |_| {
+            w.mutex.lockUncancelable(std.testing.io);
+            const ok = if (what == .held) w.held else w.sent;
+            w.mutex.unlock(std.testing.io);
+            if (ok) return;
+            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+        }
+        return error.Timeout;
+    }
+
+    const Result = struct { order: [][2]usize, warm: Reason, cached: ?u32, counts: LaneHost.AheadCounts, lanes_left: usize, cancel_stops: usize };
+
+    /// Step 1, its step-ahead pass held in its second chunk, then `second` (built from step 1's reply) and, once it
+    /// ended, `third` if any; every reply checked as the fake's. The caller frees `order`.
+    fn run(comptime second: fn (gpa: std.mem.Allocator, reply: []const u32) anyerror![]u32, third: bool) !Result {
+        const gpa = std.testing.allocator;
+        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+        defer cfg.deinit(gpa);
+        var w: AheadCut = .{};
+        errdefer w.order.deinit(gpa);
+        var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 6, .prefill_hook = hook, .prefill_hook_ctx = &w, .cancel_before = true };
+        defer target.deinit();
+        var clock: lanes.fake.FixedClock = .{};
+        var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+        defer core.deinit();
+        core.fill_chunks = 1;
+        core.fill_rounds = 2;
+        core.cut_in = 512; // every request below is short enough to cut in
+        var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &AheadKit.vtable }, AheadKit.rules, 1 << 20);
+        defer store.deinit();
+        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+        host.cache = &store;
+        host.ahead_on = true;
+        host.ahead_grid = AheadKit.grid;
+        var warm: AheadKit.Box = .{};
+        defer warm.tokens.deinit(gpa);
+        host.ahead_sink = .{ .ctx = &warm, .event = AheadKit.Box.event };
+        try host.start();
+        var stopped = false;
+        defer if (!stopped) host.stop();
+        const e = host.engine();
+        var b1: AheadKit.Box = .{};
+        defer b1.tokens.deinit(gpa);
+        try e.submit(1, &AheadKit.r1, .{ .ctx = &b1, .event = AheadKit.Box.event });
+        try std.testing.expectEqual(Reason.length, b1.wait());
+        try w.until(.held);
         const p2 = try second(gpa, b1.tokens.items);
         defer gpa.free(p2);
         var b2: AheadKit.Box = .{};
         defer b2.tokens.deinit(gpa);
-        // one reply token: no step-ahead pass after it (its own kept state is a chunk end past its prompt's tail)
-        const r2: Request = .{ .prompt = p2, .max_tokens = if (p2.len > 8) 1 else 2, .history_len = if (p2.len > 8) 16 else 0 };
+        // one reply token, its history mark the pass's point: no step-ahead pass after it
+        const r2: Request = .{ .prompt = p2, .max_tokens = if (p2.len > 8) 1 else 2, .history_len = if (p2.len > 8) AheadKit.at else 0 };
         try e.submit(2, &r2, .{ .ctx = &b2, .event = AheadKit.Box.event });
         w.mutex.lockUncancelable(std.testing.io);
         w.sent = true;
         w.mutex.unlock(std.testing.io);
         const warm_done = warm.wait();
         try std.testing.expectEqual(Reason.length, b2.wait());
-        try expectFake(p2, b2.tokens.items);
+        try AheadKit.expectFake(p2, b2.tokens.items);
         var cached = b2.cached;
         if (third) { // the step after it: step 1's history, its reply and a tool result
             const p3 = try leads(gpa, b1.tokens.items);
             defer gpa.free(p3);
             var b3: AheadKit.Box = .{};
             defer b3.tokens.deinit(gpa);
-            const r3: Request = .{ .prompt = p3, .max_tokens = 1, .history_len = 16 };
+            const r3: Request = .{ .prompt = p3, .max_tokens = 1, .history_len = AheadKit.at };
             try e.submit(3, &r3, .{ .ctx = &b3, .event = AheadKit.Box.event });
             try std.testing.expectEqual(Reason.length, b3.wait());
-            try expectFake(p3, b3.tokens.items);
+            try AheadKit.expectFake(p3, b3.tokens.items);
             cached = b3.cached;
         }
         host.stop();
         stopped = true;
-        return .{ .order = try w.order.toOwnedSlice(gpa), .warm = warm_done, .cached = cached, .counts = host.ahead_counts, .lanes_left = target.lanes.count() };
+        return .{ .order = try w.order.toOwnedSlice(gpa), .warm = warm_done, .cached = cached, .counts = host.ahead_counts, .lanes_left = target.lanes.count(), .cancel_stops = target.cancel_stops };
     }
 
-    fn expectFake(prompt: []const u32, reply: []const u32) !void {
-        var history: std.ArrayList(u32) = .empty;
-        defer history.deinit(std.testing.allocator);
-        try history.appendSlice(std.testing.allocator, prompt);
-        for (reply) |t| {
-            try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
-            try history.append(std.testing.allocator, t);
-        }
-    }
-
-    /// The next step the step-ahead pass leads to: t1, the reply, a tool result (20 tokens).
+    /// The next step the step-ahead pass leads to.
     fn leads(gpa: std.mem.Allocator, reply: []const u32) anyerror![]u32 {
-        var p: std.ArrayList(u32) = .empty;
-        errdefer p.deinit(gpa);
-        try p.appendSlice(gpa, &t1);
-        try p.appendSlice(gpa, reply);
-        try p.appendSlice(gpa, &.{ 7, 7, 5, 3 });
-        return p.toOwnedSlice(gpa);
+        return AheadKit.next(gpa, reply, false);
     }
 
     /// Another conversation's short prompt.
@@ -551,18 +643,20 @@ const AheadCut = struct {
     }
 };
 
-test "step-ahead and cut-in: a short arrival it does not lead to cancels the pass at its next chunk, never pauses it" {
+test "step-ahead and cut-in: a short arrival it does not lead to cancels the filling pass between its pieces, never pauses it" {
     const got = try AheadCut.run(AheadCut.other, true);
     defer std.testing.allocator.free(got.order);
     try std.testing.expectEqual(Reason.cancelled, got.warm);
-    // step 1's six chunks, the step-ahead pass's first (its cancel seen at its end), then the arrival's six; the pass
-    // never resumes (a cut-in would have paused it and run its other five after)
-    try std.testing.expectEqual(@as(usize, 6 + 1 + 6 + 6), got.order.len);
-    try std.testing.expectEqual([2]usize{ AheadCut.warm_len, 0 }, got.order[6]);
-    for (got.order[7..13], 0..) |o, i| try std.testing.expectEqual([2]usize{ 3, i }, o);
-    for (got.order) |o| try std.testing.expect(o[0] != AheadCut.warm_len or o[1] == 0);
-    // nothing kept at 12: the step it led to resumes where it did before, at step 1's history
-    try std.testing.expectEqual(@as(?u32, 8), got.cached);
+    // step 1's six chunks, the step-ahead pass's first two (its first piece in its admission, its second between
+    // rounds), then the arrival's six; the pass never resumes (a cut-in would have paused it and run its other four after)
+    try std.testing.expectEqual(@as(usize, 6 + 2 + 6 + 6), got.order.len);
+    for (got.order[6..8], 0..) |o, i| try std.testing.expectEqual([2]usize{ AheadKit.warm_len, i }, o);
+    for (got.order[8..14], 0..) |o, i| try std.testing.expectEqual([2]usize{ 3, i }, o);
+    for (got.order) |o| try std.testing.expect(o[0] != AheadKit.warm_len or o[1] < 2);
+    // the host's takeCancels discarded it between pieces: no chunk's own check ended it
+    try std.testing.expectEqual(@as(usize, 0), got.cancel_stops);
+    // nothing kept at 176: the step it led to resumes where it did before, at step 1's history
+    try std.testing.expectEqual(@as(?u32, AheadKit.history), got.cached);
     try std.testing.expectEqual(@as(u64, 1), got.counts.cancelled);
     try std.testing.expectEqual(@as(u64, 0), got.counts.ran);
     try std.testing.expectEqual(@as(usize, 0), got.lanes_left);
@@ -574,10 +668,11 @@ test "step-ahead and cut-in: a short arrival it leads to waits for the whole pas
     try std.testing.expectEqual(Reason.length, got.warm);
     // step 1's six chunks, the step-ahead pass's six, then the arrival's: short as it is, it did not cut in
     try std.testing.expectEqual(@as(usize, 18), got.order.len);
-    for (got.order[6..12], 0..) |o, i| try std.testing.expectEqual([2]usize{ AheadCut.warm_len, i }, o);
-    for (got.order[12..18], 0..) |o, i| try std.testing.expectEqual([2]usize{ 20, i }, o);
-    try std.testing.expectEqual(@as(?u32, 12), got.cached);
+    for (got.order[6..12], 0..) |o, i| try std.testing.expectEqual([2]usize{ AheadKit.warm_len, i }, o);
+    for (got.order[12..18], 0..) |o, i| try std.testing.expectEqual([2]usize{ AheadKit.warm_len + 4, i }, o);
+    try std.testing.expectEqual(@as(?u32, AheadKit.at), got.cached);
     try std.testing.expectEqual(@as(u64, 1), got.counts.ran);
+    try std.testing.expectEqual(@as(u64, 1), got.counts.resumed);
     try std.testing.expectEqual(@as(u64, 0), got.counts.cancelled);
     try std.testing.expectEqual(@as(usize, 0), got.lanes_left);
 }
@@ -676,11 +771,10 @@ test "step-ahead and the spill tier: its kept state goes through the queued writ
     var clock: lanes.fake.FixedClock = .{};
     var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
     defer core.deinit();
-    const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
     var b1: AheadKit.Box = .{};
     defer b1.tokens.deinit(gpa);
     {
-        var store = pc.Store.init(gpa, .{ .ptr = &disk, .vtable = &AheadDisk.vtable }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
+        var store = pc.Store.init(gpa, .{ .ptr = &disk, .vtable = &AheadDisk.vtable }, AheadKit.rules, 1 << 20);
         defer store.deinit(); // (lists the writes still queued, as a server's close does)
         store.imprint = &im;
         store.spill = true;
@@ -690,24 +784,23 @@ test "step-ahead and the spill tier: its kept state goes through the queued writ
         defer host.stop();
         host.cache = &store;
         host.ahead_on = true;
-        host.ahead_grid = .{ .chunk = 4, .tail = 2 };
+        host.ahead_grid = AheadKit.grid;
         host.ahead_sink = .{ .ctx = &warm, .event = AheadKit.Box.event };
         try host.start();
-        const r1: Request = .{ .prompt = &t1, .max_tokens = 6, .history_len = 8 };
-        try host.engine().submit(1, &r1, .{ .ctx = &b1, .event = AheadKit.Box.event });
+        try host.engine().submit(1, &AheadKit.r1, .{ .ctx = &b1, .event = AheadKit.Box.event });
         try std.testing.expectEqual(Reason.length, b1.wait());
         try std.testing.expectEqual(Reason.length, warm.wait());
-        // step 1's state at 8 and the pass's at 12, both queued to the writer and neither listed yet
+        // step 1's state at 32 and the pass's at 176, both queued to the writer and neither listed yet
         try std.testing.expectEqual(@as(usize, 2), store.pending.items.len);
         try std.testing.expectEqual(@as(usize, 0), im.metas.items.len);
         disk.finishAll();
     }
-    var warm_tokens: [12]u32 = undefined;
-    @memcpy(warm_tokens[0..10], &t1);
-    @memcpy(warm_tokens[10..], b1.tokens.items[0..2]);
-    try std.testing.expect(im.has(imprint.Imprint.keyOf(t1[0..8])) and im.has(imprint.Imprint.keyOf(&warm_tokens)));
+    var warm_tokens: [AheadKit.at]u32 = undefined;
+    @memcpy(warm_tokens[0..AheadKit.t1.len], &AheadKit.t1);
+    @memcpy(warm_tokens[AheadKit.t1.len..], b1.tokens.items[0 .. AheadKit.at - AheadKit.t1.len]);
+    try std.testing.expect(im.has(imprint.Imprint.keyOf(AheadKit.t1[0..AheadKit.history])) and im.has(imprint.Imprint.keyOf(&warm_tokens)));
     // a restart: nothing in memory, the index on disk; the step after step 1 reads the pass's state back
-    var store = pc.Store.init(gpa, .{ .ptr = &disk, .vtable = &AheadDisk.vtable }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
+    var store = pc.Store.init(gpa, .{ .ptr = &disk, .vtable = &AheadDisk.vtable }, AheadKit.rules, 1 << 20);
     defer store.deinit();
     store.imprint = &im;
     store.spill = true;
@@ -719,9 +812,9 @@ test "step-ahead and the spill tier: its kept state goes through the queued writ
     defer gpa.free(p2);
     var b2: AheadKit.Box = .{};
     defer b2.tokens.deinit(gpa);
-    const r2: Request = .{ .prompt = p2, .max_tokens = 4, .history_len = 16 };
+    const r2: Request = .{ .prompt = p2, .max_tokens = 4, .history_len = AheadKit.at };
     try host.engine().submit(2, &r2, .{ .ctx = &b2, .event = AheadKit.Box.event });
     try std.testing.expectEqual(Reason.length, b2.wait());
-    try std.testing.expectEqual(@as(?u32, 12), b2.cached);
-    try AheadCut.expectFake(p2, b2.tokens.items);
+    try std.testing.expectEqual(@as(?u32, AheadKit.at), b2.cached);
+    try AheadKit.expectFake(p2, b2.tokens.items);
 }
