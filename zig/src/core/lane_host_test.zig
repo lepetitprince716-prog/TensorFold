@@ -446,6 +446,7 @@ const CutIn = struct {
         var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
         defer cfg.deinit(gpa);
         var w: CutIn = .{};
+        errdefer w.seen.deinit(gpa);
         defer w.a.deinit(gpa);
         defer w.b.deinit(gpa);
         var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 6, .prefill_hook = hook, .prefill_hook_ctx = &w, .refuse_full = refuse_full };
@@ -467,6 +468,7 @@ const CutIn = struct {
         w.sent = true;
         w.mutex.unlock(std.testing.io);
         try w.until(.done);
+        try std.testing.expectEqual(@as(usize, 0), target.refuse_full); // every refusal was spent, none left unseen
         for ([_][]const u32{ &long, second }, [_][]const u32{ w.a.items, w.b.items }) |prompt, reply| {
             var history: std.ArrayList(u32) = .empty;
             defer history.deinit(gpa);

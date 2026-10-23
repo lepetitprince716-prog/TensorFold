@@ -373,6 +373,8 @@ pub const LaneHost = struct {
             return h.drop(job, h.words(e));
         };
         if (h.core.filling == &job.stream) {
+            // its first piece restored any kept state: report it now, before a cut-in's lookup or keep can evict the entry
+            job.reported();
             h.filling = job; // its next pieces run between rounds (fillOne)
             return true;
         }
