@@ -149,8 +149,9 @@ pub const PassGraphs = struct {
         defer graph.deinit();
         var exec = try graph.instantiate();
         errdefer exec.deinit();
-        try g.map.put(g.gpa, key, exec);
+        // launched before it is kept, as round.Graphs: a failed launch frees it here and leaves no handle in the map
         try exec.launchOn(e.s);
+        try g.map.put(g.gpa, key, exec);
     }
 };
 

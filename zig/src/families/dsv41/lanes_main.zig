@@ -95,6 +95,8 @@ pub fn main(init: std.process.Init) !u8 {
             o.side = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--graphs")) {
             o.graphs = !std.mem.eql(u8, val, "0");
+        } else if (std.mem.eql(u8, key, "--graph-cap")) {
+            o.graph_cap = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--serial")) {
             serial = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--fix-k")) {

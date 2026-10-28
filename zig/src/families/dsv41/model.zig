@@ -56,6 +56,7 @@ pub const Options = struct {
     // ring (rdma.zig), or at world 4 the 2D split's decode-size exchanges over its rings (ring2d.zig)
     rdma_kernels: ?[]const u8 = null, // world 4: the rings' kernels' image (rdma_gather.cu's fatbin; null: the embedded one)
     graphs: bool = false, // the rounds' stretches as CUDA graphs (round.Graphs)
+    graph_cap: usize = 0, // the captured stretches kept at most, least recently replayed out first (TF_DS_GRAPH_CAP; 0: all)
     side: bool = false, // the mixes' side work on a stream of its own (round.Round.useSide)
     prefetch: bool = false, // the paced L2 prefetch (round.Round.usePrefetch)
     engram_aio: bool = false, // a round's Engram reads by Linux AIO on O_DIRECT (else the reader pool)
@@ -311,7 +312,7 @@ pub const Model = struct {
         m.candidate_out = 0;
         m.candidate_host = &.{};
         m.candidate_nan = 0;
-        if (o.graphs) m.graphs = round.Graphs.init(gpa);
+        if (o.graphs) m.graphs = round.Graphs.init(gpa, o.graph_cap);
         if (o.side) try m.rd.useSide(&m.eng);
         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
         if (o.drafts) {
